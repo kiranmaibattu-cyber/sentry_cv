@@ -11,7 +11,7 @@ container startup.
 ## Current Image
 
 ```text
-ghcr.io/apexflo-labs/sentinel-cv-runtime:intel-285h-2026.10.05-v5.2-dev4
+ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.07-v5.2-dev5
 ```
 
 The image is built from:
@@ -21,9 +21,10 @@ The image is built from:
 - `newdetails/sentry-v5.2`
 - baked OpenVINO/ONNX model files under `models/`
 
-This package already exists in GHCR and is public. The image is built from this
-repository and carries `org.opencontainers.image.source` pointing at
-`https://github.com/ApexFlo-Labs/sentry_cv`.
+This package is published to the personal GHCR namespace for integration
+testing. The image is built from this repository and carries
+`org.opencontainers.image.source` pointing at
+`https://github.com/kiranmaibattu-cyber/sentry_cv`.
 
 ## Runtime Contract
 
@@ -74,15 +75,15 @@ localhost/apexfabric-intel-traffic-runtime-base:intel-285h-2026.09.18-v2
 Build the GHCR image:
 
 ```bash
-SENTINEL_IMAGE_REPOSITORY=ghcr.io/apexflo-labs/sentinel-cv-runtime \
-SENTINEL_IMAGE_VERSION=2026.10.05-v5.2-dev4 \
+SENTINEL_IMAGE_REPOSITORY=ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime \
+SENTINEL_IMAGE_VERSION=2026.10.07-v5.2-dev5 \
 ./scripts/build_sentinel_v5_2_image.sh
 ```
 
 Push it:
 
 ```bash
-podman push ghcr.io/apexflo-labs/sentinel-cv-runtime:intel-285h-2026.10.05-v5.2-dev4
+podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.07-v5.2-dev5
 ```
 
 ## Contract And Design Docs

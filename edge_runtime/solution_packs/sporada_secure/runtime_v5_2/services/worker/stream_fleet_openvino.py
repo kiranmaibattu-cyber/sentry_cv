@@ -198,6 +198,9 @@ def consume_packet(packet, geo, tracker, analytics_stage, stab, async_ocr):
         text = stab.confirmed_text(packet.name, track_id)
         if text:
             plate.metadata["ocr_text"] = text
+            confidence = stab.confirmed_confidence(packet.name, track_id)
+            if confidence is not None:
+                plate.metadata["ocr_confidence"] = confidence
         provisional = stab.text_for(packet.name, track_id)
         if provisional:
             plate.metadata["ocr_provisional"] = provisional
@@ -346,15 +349,18 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
 
     stab = OcrStabilizer(
         min_confidence=float(os.getenv(
-            "OCR_MIN_CONFIDENCE", str(plate_config.get("ocr_min_confidence", 0.4))
+            "OCR_MIN_CONFIDENCE", str(plate_config.get("ocr_min_confidence", 0.25))
         )),
         min_plate_width=int(os.getenv(
-            "PLATE_MIN_WIDTH", str(plate_config.get("min_width", 32))
+            "PLATE_MIN_WIDTH", str(plate_config.get("min_width", 16))
         )),
         confirm_min_reads=int(os.getenv(
-            "OCR_CONFIRM_MIN_READS", str(plate_config.get("confirm_min_reads", 4))
+            "OCR_CONFIRM_MIN_READS", str(plate_config.get("confirm_min_reads", 1))
         )),
         positional_min_character_ratio=mc.lp_ocr_stable_char_ratio,
+        require_format=str(os.getenv(
+            "OCR_REQUIRE_FORMAT", str(plate_config.get("require_format", False))
+        )).lower() in {"1", "true", "yes"},
     )
     async_ocr = None
     if enable_plate:
@@ -440,19 +446,19 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
                         width=pd.bbox[2] - pd.bbox[0],
                         height=pd.bbox[3] - pd.bbox[1],
                         min_width=int(os.getenv(
-                            "PLATE_MIN_WIDTH", str(plate_config.get("min_width", 32))
+                            "PLATE_MIN_WIDTH", str(plate_config.get("min_width", 16))
                         )),
                         min_height=int(os.getenv(
-                            "PLATE_MIN_HEIGHT", str(plate_config.get("min_height", 10))
+                            "PLATE_MIN_HEIGHT", str(plate_config.get("min_height", 5))
                         )),
                         min_sharpness=float(os.getenv(
-                            "PLATE_MIN_SHARPNESS", str(plate_config.get("min_sharpness", 20.0))
+                            "PLATE_MIN_SHARPNESS", str(plate_config.get("min_sharpness", 0.0))
                         )),
                         min_aspect_ratio=float(os.getenv(
-                            "PLATE_MIN_ASPECT", str(plate_config.get("min_aspect_ratio", 1.2))
+                            "PLATE_MIN_ASPECT", str(plate_config.get("min_aspect_ratio", 0.8))
                         )),
                         max_aspect_ratio=float(os.getenv(
-                            "PLATE_MAX_ASPECT", str(plate_config.get("max_aspect_ratio", 8.0))
+                            "PLATE_MAX_ASPECT", str(plate_config.get("max_aspect_ratio", 12.0))
                         )),
                     ):
                         continue

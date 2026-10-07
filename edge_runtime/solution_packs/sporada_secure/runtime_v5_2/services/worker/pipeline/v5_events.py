@@ -81,6 +81,8 @@ class V5EventPipeline:
         self.candidate_max_gap = float(os.getenv("SENTINEL_CANDIDATE_MAX_GAP_SECONDS", "1.5"))
         self.hazard_min_confidence = float(os.getenv("SENTINEL_HAZARD_MIN_CONFIDENCE", "0.55"))
         self.feature_cooldown = float(os.getenv("SENTINEL_FEATURE_IMPROVEMENT_COOLDOWN_SECONDS", "5"))
+        self.plate_outcome_delay = float(os.getenv("SENTINEL_PLATE_OUTCOME_DELAY_SECONDS", "3"))
+        self.plate_confidence_improvement = float(os.getenv("SENTINEL_PLATE_CONFIDENCE_IMPROVEMENT", "0.10"))
         self.store = SentinelV2Outbox(Path(os.getenv("APEXFABRIC_STATE_ROOT", "/state")), camera_id)
         self.uploader = None
         base_url = os.getenv("SENTINEL_INGEST_BASE_URL", "").strip()
@@ -694,31 +696,47 @@ class V5EventPipeline:
                 use_case_id = binding["use_case_id"]
                 attempt = state["plate_attempts"].setdefault(use_case_id, {"started": now, "provisional": False})
                 attempt["provisional"] = attempt["provisional"] or bool(plate.metadata.get("ocr_provisional"))
-                if not text or text == state["plates"].get(use_case_id, (None, None))[0]:
+                if not text:
+                    if (use_case_id not in state["plate_outcomes"]
+                            and now - attempt["started"] >= self.plate_outcome_delay):
+                        event = self._event("plate_outcome", now, frame_id, use_case_id,
+                                            presence_id=state["id"], track_id=state["track_id"],
+                                            outcome="unreadable")
+                        media = self._evidence(event, frame_id, packet.frame, "frame", None, packet.frame.shape, now)
+                        event["evidence_ids"] = [media[0]["evidence_id"]]
+                        self._persist(event, [media])
+                        state["plate_outcomes"].add(use_case_id)
                     continue
                 previous = state["plates"].get(use_case_id)
+                confidence = plate.metadata.get("ocr_confidence", plate.confidence)
+                confidence = max(0.0, min(1.0, float(confidence)))
+                if previous:
+                    previous_text, _previous_observation_id = previous[:2]
+                    previous_confidence = float(previous[2]) if len(previous) > 2 else 0.0
+                    if (text == previous_text
+                            and confidence < previous_confidence + self.plate_confidence_improvement):
+                        continue
                 event = self._event("plate_read", now, frame_id, binding["use_case_id"],
                                     presence_id=state["id"], track_id=state["track_id"],
                                     zone_id=next((value for value in binding["geometry_ids"] if value in containing), None),
                                     plate_text=text, partial=False,
-                                    confidence=max(0.0, min(1.0, float(plate.confidence))),
+                                    confidence=confidence,
                                     plate_bbox_normalized=bbox_normalized(plate.bbox, width, height),
                                     supersedes_observation_id=previous[1] if previous else None)
                 media = self._evidence(event, frame_id, packet.frame, "frame", None, packet.frame.shape, now)
                 event["evidence_ids"] = [media[0]["evidence_id"]]
                 self._persist(event, [media])
-                state["plates"][use_case_id] = (text, event["observation_id"])
+                state["plates"][use_case_id] = (text, event["observation_id"], confidence)
         for state in self.presences.values():
             if state["kind"] != "vehicle" or state["lost"]:
                 continue
             for use_case_id, attempt in state["plate_attempts"].items():
                 if (use_case_id in state["plates"] or use_case_id in state["plate_outcomes"]
-                        or now - attempt["started"] < 12):
+                        or now - attempt["started"] < self.plate_outcome_delay):
                     continue
-                outcome = "unreadable" if attempt["provisional"] else "timed_out"
                 self._persist(self._event("plate_outcome", now, frame_id, use_case_id,
                                           presence_id=state["id"], track_id=state["track_id"],
-                                          outcome=outcome))
+                                          outcome="unreadable"))
                 state["plate_outcomes"].add(use_case_id)
 
     def _hazards(self, packet, now, frame_id):

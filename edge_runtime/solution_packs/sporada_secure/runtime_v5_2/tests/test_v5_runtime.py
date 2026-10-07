@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "services" / "worker"))
 
 from pipeline import v5_events
 from pipeline.v5_events import V5EventPipeline
+from pipeline.ocr_stabilizer import OcrStabilizer
 from pipeline.sentinel_delivery import SentinelV2Uploader
 from detectors.backends.openvino_ocr_async import AsyncOCR
 from detectors.backends.openvino_smoke_fire import _device_with_fallback
@@ -431,6 +432,42 @@ def test_plate_attempt_has_one_failure_outcome_and_later_correction(tmp_path, mo
         first = next(item for item in items if item["supersedes_observation_id"] is None)
         correction = next(item for item in items if item["supersedes_observation_id"] is not None)
         assert correction["supersedes_observation_id"] == first["observation_id"]
+
+
+def test_anpr_accepts_single_non_indian_in_range_read():
+    stabilizer = OcrStabilizer()
+    stabilizer.observe("cam", 7, "GARAGE-12", 0.26, 1, plate_width=80)
+    assert stabilizer.confirmed_text("cam", 7) == "GARAGE12"
+    assert stabilizer.confirmed_confidence("cam", 7) == pytest.approx(0.26)
+
+
+def test_anpr_rejects_below_range_read_but_keeps_provisional():
+    stabilizer = OcrStabilizer()
+    stabilizer.observe("cam", 7, "GARAGE-12", 0.12, 1, plate_width=80)
+    assert stabilizer.confirmed_text("cam", 7) is None
+    assert stabilizer.text_for("cam", 7) == "GARAGE12"
+
+
+def test_anpr_improved_confidence_supersedes_same_plate(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    pipeline = V5EventPipeline("cam", config([binding("plate", "anpr")]))
+    for index in range(3):
+        pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
+    low = packet(3, [("car", 1, (20, 20, 70, 75))])
+    low.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                          confidence=.8,
+                                          metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .30},
+                                          parent_id=1))
+    high = packet(4, [("car", 1, (20, 20, 70, 75))])
+    high.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                           confidence=.8,
+                                           metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .45},
+                                           parent_id=1))
+    pipeline.process(low)
+    pipeline.process(high)
+    reads = [item for item in events(tmp_path) if item["event_type"] == "plate_read"]
+    assert [item["confidence"] for item in reads] == [.30, .45]
+    assert reads[1]["supersedes_observation_id"] == reads[0]["observation_id"]
 
 
 def test_delivery_orders_event_evidence_embedding(tmp_path, monkeypatch):

@@ -1,10 +1,10 @@
 # Sentinel V5.2 Development Image
 
-Local image: `localhost/sentinel-cv-runtime:intel-285h-2026.10.05-v5.2-dev4`
+Local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.07-v5.2-dev5`
 
-GHCR image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.05-v5.2-dev4`
+GHCR image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.07-v5.2-dev5`
 
-Registry digest: `sha256:54cd1b5c3af020749d819daa918fcae528387c788a3d934fca1681a536801e1d`
+Registry digest: `sha256:800d8295b93da2f081aca219ad5bdb9b02252bb99355b53168c30e00d62ac198`
 
 Build: `bash scripts/build_sentinel_v5_2_image.sh`
 
@@ -13,7 +13,7 @@ This is a separate runtime from V4. It accepts the V5.2 desired-state bindings a
 ## Verified
 
 - V5.2 package validator passes: 5 schemas and 16 representative Event examples.
-- V5.2 runtime tests pass (23): desired-state rejection, count/presence/zone episodes, boundary jitter, bounded candidate confirmation, loss/recovery, ANPR read/correction/outcome, face best-candidate selection and cooldown, independent face/body samples, line crossing, timed hazard clear and score gate, scene pressure, fail-closed accelerator/decode configuration, and ordered upload.
+- V5.2 runtime tests pass (26): desired-state rejection, count/presence/zone episodes, boundary jitter, bounded candidate confirmation, loss/recovery, ANPR read/correction/outcome, loosened OCR gates, confidence-improvement superseding reads, face best-candidate selection and cooldown, independent face/body samples, line crossing, timed hazard clear and score gate, scene pressure, fail-closed accelerator/decode configuration, and ordered upload.
 - V5.2 inference requests only GPU/NPU. The worker rejects CPU/AUTO device configuration; fire/smoke and OCR no longer select CPU if requested accelerators are absent. VA-API decode is mandatory, and `OV_DECODE_HW=0` raises an error in the packaged image. CPU preprocessing, color conversion, tracking, and serialization still occur.
 - Presence candidates require three observations within a bounded gap. Zone transitions require two clear observations beyond a normalized boundary margin. Fire/smoke requires three qualifying evaluated frames within two seconds and ten seconds of evaluated negatives to clear. The edge records decoded-frame receipt time before inference, rather than the later Event creation time. Face/body improvements have a five-second cooldown; camera-health heartbeat is 30 seconds.
 - A local HTTP receiver verified authenticated V5 Event -> Evidence -> Embedding upload, acknowledgement, and outbox cleanup. It is not the real Management service.
@@ -25,6 +25,7 @@ This is a separate runtime from V4. It accepts the V5.2 desired-state bindings a
 - All 3,812 queued observations, 1,457 evidence metadata records, and 592 embeddings from that run validated against the V5.2 schemas. All 1,457 JPEGs existed and matched their declared hashes, sizes, and observation links.
 - With `dev3`, a bounded 85-second three-camera run on traffic1, traffic2, and ch9 held about 8 fps per worker after warm-up using full-frame scene, person identity, and vehicle presence bindings. It produced 1,747 schema-valid observations, 693 evidence items, and 277 embeddings with valid evidence hashes/links. Scene sampling averaged about 2.1 seconds per camera. This is not the full app set on three cameras.
 - With `dev4`, the complete example app set on traffic1 reached `/readyz`, initialized vehicle/plate/fire on GPU, OCR on GPU+NPU, face on GPU+NPU, body/gait on NPU, scene on GPU, and VA-API decode. Its bounded 60-second run produced 410 schema-valid observations, 198 evidence items, and 105 embeddings. No smoke Event was emitted in that window. The observed full-app throughput was about 4-5 fps against an 8-fps target.
+- With `dev5`, one-camera live smoke tests on traffic1, traffic2, and ch9 reached `/readyz` with vehicle and plate on GPU, OCR on GPU+NPU, scene on GPU, and VA-API decode. traffic1 and traffic2 produced V5.2 outbox records with scene evidence/embeddings, object-present evidence, and ANPR outcomes/reads; ch9 produced scene samples with evidence/embeddings in the short run.
 
 ## Not Yet Release-Ready
 

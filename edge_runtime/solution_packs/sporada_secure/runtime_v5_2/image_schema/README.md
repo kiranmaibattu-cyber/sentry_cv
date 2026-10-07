@@ -73,7 +73,9 @@ separate from count measurements.
 ANPR sends the selected **source frame** as `frame` evidence and the plate's
 normalized bbox in `plate_read`. Management draws the box on that frame; the
 edge need not burn an overlay into the JPEG. There is no separate plate-crop
-upload. In/out crossings and positive zone transitions
+upload. When a plate candidate is present but OCR cannot produce usable text,
+or the OCR confidence is below the accepted range, initially `0.25`, the edge emits
+`plate_outcome: unreadable` rather than staying silent. In/out crossings and positive zone transitions
 reference selected context frames. Selected `person_feature_sample` Events
 attach a person crop, wider face crop, or representative gait frame; face and
 body samples can arrive independently. Scene samples link the exact frame and SigLIP2 vector.
