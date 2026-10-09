@@ -83,6 +83,20 @@ class V5EventPipeline:
         self.feature_cooldown = float(os.getenv("SENTINEL_FEATURE_IMPROVEMENT_COOLDOWN_SECONDS", "5"))
         self.plate_outcome_delay = float(os.getenv("SENTINEL_PLATE_OUTCOME_DELAY_SECONDS", "3"))
         self.plate_confidence_improvement = float(os.getenv("SENTINEL_PLATE_CONFIDENCE_IMPROVEMENT", "0.10"))
+        self.plate_update_cooldown = float(os.getenv("SENTINEL_PLATE_UPDATE_COOLDOWN_SECONDS", "5"))
+        self.plate_change_min_confidence = float(os.getenv("SENTINEL_PLATE_CHANGE_MIN_CONFIDENCE", "0.90"))
+        self.plate_change_margin = float(os.getenv("SENTINEL_PLATE_CHANGE_MARGIN", "0.10"))
+        self.plate_low_confidence_replace = float(os.getenv("SENTINEL_PLATE_LOW_CONFIDENCE_REPLACE", "0.50"))
+        self.plate_candidate_window = float(os.getenv("SENTINEL_PLATE_CANDIDATE_WINDOW_SECONDS", "2.0"))
+        self.plate_emit_min_reads = int(os.getenv("SENTINEL_PLATE_EMIT_MIN_READS", "2"))
+        self.plate_emit_min_confidence = float(os.getenv("SENTINEL_PLATE_EMIT_MIN_CONFIDENCE", "0.30"))
+        self.plate_single_read_confidence = float(os.getenv("SENTINEL_PLATE_SINGLE_READ_CONFIDENCE", "0.75"))
+        self.plate_fast_emit_confidence = float(os.getenv("SENTINEL_PLATE_FAST_EMIT_CONFIDENCE", "0.85"))
+        self.presence_close_unobserved_after = float(os.getenv("SENTINEL_PRESENCE_UNOBSERVED_AFTER_SECONDS", "2"))
+        self.presence_close_ended_after = float(os.getenv("SENTINEL_PRESENCE_ENDED_UNKNOWN_AFTER_SECONDS", "8"))
+        self.presence_wide_unobserved_after = float(os.getenv("SENTINEL_WIDE_PRESENCE_UNOBSERVED_AFTER_SECONDS", "4.5"))
+        self.presence_wide_ended_after = float(os.getenv("SENTINEL_WIDE_PRESENCE_ENDED_UNKNOWN_AFTER_SECONDS", "18"))
+        self.vehicle_recovery_gap = float(os.getenv("SENTINEL_VEHICLE_RECOVERY_GAP_SECONDS", "12"))
         self.store = SentinelV2Outbox(Path(os.getenv("APEXFABRIC_STATE_ROOT", "/state")), camera_id)
         self.uploader = None
         base_url = os.getenv("SENTINEL_INGEST_BASE_URL", "").strip()
@@ -255,24 +269,88 @@ class V5EventPipeline:
     def _center(box):
         return ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
 
-    def _reassociate(self, kind, box, vector, now, active_keys):
-        if kind != "person" or vector is None:
+    @staticmethod
+    def _box_size(box):
+        return max(1.0, float(box[2] - box[0])), max(1.0, float(box[3] - box[1]))
+
+    @staticmethod
+    def _vehicle_type(class_name):
+        return class_name if class_name in {"car", "truck", "van", "bus", "motorcycle"} else "other"
+
+    def _presence_timeouts(self, state):
+        width_height = state.get("frame_size")
+        if width_height is None:
+            return self.presence_close_unobserved_after, self.presence_close_ended_after
+        width, height = width_height
+        box_width, box_height = self._box_size(state["box"])
+        norm_width = box_width / max(1.0, float(width))
+        norm_height = box_height / max(1.0, float(height))
+        if max(norm_width, norm_height) < 0.12 or min(norm_width, norm_height) < 0.05:
+            return self.presence_wide_unobserved_after, self.presence_wide_ended_after
+        return self.presence_close_unobserved_after, self.presence_close_ended_after
+
+    def _recovery_distance_limit(self, state, box):
+        width_height = state.get("frame_size")
+        frame_scale = 320.0
+        if width_height is not None:
+            frame_scale = max(160.0, 0.17 * math.hypot(*width_height))
+        old_w, old_h = self._box_size(state["box"])
+        new_w, new_h = self._box_size(box)
+        subject_scale = 2.5 * max(old_w, old_h, new_w, new_h)
+        return min(520.0, max(120.0, frame_scale, subject_scale))
+
+    def _reassociate(self, kind, box, vector, now, active_keys, class_name=None):
+        if kind == "person":
+            if vector is None:
+                return None
+            best = None
+            for state in self.presences.values():
+                if state["kind"] != kind or not state["lost"] or state["track_key"] in active_keys:
+                    continue
+                _, ended_after = self._presence_timeouts(state)
+                if now - state["last_seen"] > ended_after or state.get("body_vector") is None:
+                    continue
+                if np.linalg.norm(np.subtract(self._center(box), self._center(state["box"]))) > self._recovery_distance_limit(state, box):
+                    continue
+                similarity = float(np.dot(vector, state["body_vector"]))
+                if similarity >= 0.78 and (best is None or similarity > best[0]):
+                    best = similarity, state
+            return best[1] if best else None
+
+        if kind != "vehicle":
             return None
-        best = None
+        candidates = []
         for state in self.presences.values():
             if state["kind"] != kind or not state["lost"] or state["track_key"] in active_keys:
                 continue
-            if now - state["last_seen"] > 8 or state.get("body_vector") is None:
+            _, ended_after = self._presence_timeouts(state)
+            if now - state["last_seen"] > min(ended_after, self.vehicle_recovery_gap):
                 continue
-            if np.linalg.norm(np.subtract(self._center(box), self._center(state["box"]))) > 320:
+            limit = self._recovery_distance_limit(state, box)
+            distance = float(np.linalg.norm(np.subtract(self._center(box), self._center(state["box"]))))
+            if distance > limit:
                 continue
-            similarity = float(np.dot(vector, state["body_vector"]))
-            if similarity >= 0.78 and (best is None or similarity > best[0]):
-                best = similarity, state
-        return best[1] if best else None
+            old_w, old_h = self._box_size(state["box"])
+            new_w, new_h = self._box_size(box)
+            size_ratio = max(old_w / new_w, new_w / old_w, old_h / new_h, new_h / old_h)
+            if size_ratio > 2.4:
+                continue
+            previous_type = state.get("vehicle_type")
+            current_type = self._vehicle_type(class_name)
+            type_cost = 0.0 if previous_type in {None, current_type, "other"} or current_type == "other" else 0.25
+            score = distance / limit + min(0.5, abs(math.log(size_ratio))) + type_cost
+            candidates.append((score, state))
+        candidates.sort(key=lambda item: item[0])
+        if not candidates or candidates[0][0] > 0.95:
+            return None
+        if len(candidates) > 1 and candidates[1][0] - candidates[0][0] < 0.20:
+            return None
+        return candidates[0][1]
 
     def process(self, packet, faces=()):
-        now = getattr(packet, "frame_received_at", None) or time.time()
+        now = (getattr(packet, "frame_observed_at", None)
+               or getattr(packet, "frame_received_at", None)
+               or time.time())
         self.last_reliable_at = now
         frame_id = f"{self.camera_id}:{packet.index}"
         frame = packet.frame
@@ -295,7 +373,7 @@ class V5EventPipeline:
             state = self.tracks.get(key)
             recovered_from = None
             if state is None:
-                state = self._reassociate(kind, item.bbox, vector, now, active_keys)
+                state = self._reassociate(kind, item.bbox, vector, now, active_keys, item.class_name)
                 if state is None:
                     state = {"id": str(uuid.uuid4()), "kind": kind, "track_key": key,
                              "track_id": track_id, "first_seen": now, "last_seen": now,
@@ -303,7 +381,8 @@ class V5EventPipeline:
                              "zone_votes": {}, "line_state": {}, "owner": None,
                              "last_object": 0.0, "last_feature": {}, "plates": {},
                              "plate_attempts": {}, "plate_outcomes": set(),
-                             "lost": False, "body_vector": None}
+                             "lost": False, "body_vector": None,
+                             "vehicle_type": self._vehicle_type(item.class_name) if kind == "vehicle" else None}
                     self.presences[state["id"]] = state
                 else:
                     previous = state["track_id"]
@@ -323,6 +402,8 @@ class V5EventPipeline:
             state["box"] = item.bbox
             state["frame_size"] = (width, height)
             state["lost"] = False
+            if kind == "vehicle":
+                state["vehicle_type"] = self._vehicle_type(item.class_name)
             if vector is not None:
                 state["body_vector"] = vector
                 state["last_body_at"] = now
@@ -629,7 +710,8 @@ class V5EventPipeline:
                     self.tracks.pop(key, None)
                     self.presences.pop(state["id"], None)
                 continue
-            if gap >= 2 and not state["lost"]:
+            unobserved_after, ended_after = self._presence_timeouts(state)
+            if gap >= unobserved_after and not state["lost"]:
                 state["lost"] = True
                 for episode in state["episodes"].values():
                     episode["observation_state"] = "unobserved"
@@ -637,7 +719,7 @@ class V5EventPipeline:
                                           track_id=state["track_id"], object_type=state["kind"],
                                           last_seen_at=utc(state["last_seen"]), zone_episodes=self._episodes(state),
                                           reason="unknown"))
-            if gap >= 8:
+            if gap >= ended_after:
                 for episode in state["episodes"].values():
                     episode["observation_state"] = "ended_unknown"
                 self._persist(self._event("presence_ended_unknown", now, None,
@@ -678,6 +760,124 @@ class V5EventPipeline:
                                           coverage_state="complete"))
                 state["value"], state["sent"] = count, now
 
+    def _plate_attempt(self, state, use_case_id, now):
+        return state["plate_attempts"].setdefault(use_case_id, {
+            "started": now, "provisional": False, "candidates": [],
+            "last_frame": None, "last_frame_id": None, "last_captured_at": now,
+            "last_bbox": None, "last_frame_shape": None,
+        })
+
+    @staticmethod
+    def _plate_sharpness(crop):
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return 0.0
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _plate_candidate(self, packet, plate, text, confidence, containing, now, frame_id):
+        crop, _ = self._crop(packet.frame, plate.bbox)
+        width = max(1.0, float(plate.bbox[2] - plate.bbox[0]))
+        height = max(1.0, float(plate.bbox[3] - plate.bbox[1]))
+        area_score = min(1.0, (width * height) / 1600.0)
+        sharpness_score = min(1.0, self._plate_sharpness(crop) / 80.0)
+        score = 0.72 * confidence + 0.18 * area_score + 0.10 * sharpness_score
+        return {
+            "text": text, "confidence": confidence, "score": score,
+            "bbox": tuple(float(value) for value in plate.bbox),
+            "frame": packet.frame.copy(), "frame_shape": packet.frame.shape,
+            "frame_id": frame_id, "captured_at": now,
+            "containing": set(containing),
+        }
+
+    def _best_plate_candidate(self, attempt):
+        candidates = list(attempt.get("candidates") or [])
+        if not candidates:
+            return None, 0
+        counts = {}
+        for candidate in candidates:
+            counts[candidate["text"]] = counts.get(candidate["text"], 0) + 1
+        best = max(candidates, key=lambda item: (
+            item["score"] + min(0.15, 0.05 * max(0, counts[item["text"]] - 1)),
+            item["confidence"],
+        ))
+        return best, counts[best["text"]]
+
+    def _plate_read_allowed(self, previous, candidate, sent_at):
+        confidence = candidate["confidence"]
+        text = candidate["text"]
+        if not previous:
+            return True
+        previous_text, _previous_observation_id = previous[:2]
+        previous_confidence = float(previous[2]) if len(previous) > 2 else 0.0
+        previous_sent_at = float(previous[3]) if len(previous) > 3 else 0.0
+        if text == previous_text:
+            return (confidence >= previous_confidence + self.plate_confidence_improvement
+                    and sent_at - previous_sent_at >= self.plate_update_cooldown)
+        fast_replace = (previous_confidence < self.plate_low_confidence_replace
+                        and confidence >= self.plate_change_min_confidence)
+        if fast_replace:
+            return True
+        return (sent_at - previous_sent_at >= self.plate_update_cooldown
+                and confidence >= self.plate_change_min_confidence
+                and confidence >= previous_confidence + self.plate_change_margin)
+
+    def _plate_candidate_ready(self, attempt, previous, now):
+        candidate, read_count = self._best_plate_candidate(attempt)
+        if candidate is None:
+            return None
+        if candidate["confidence"] < self.plate_emit_min_confidence:
+            return None
+        if not self._plate_read_allowed(previous, candidate, now):
+            return None
+        elapsed = now - attempt["started"]
+        if previous and elapsed >= min(1.0, self.plate_candidate_window):
+            return candidate
+        repeated = read_count >= self.plate_emit_min_reads
+        fast_repeated = repeated and candidate["confidence"] >= self.plate_fast_emit_confidence
+        high_single_after_window = (
+            elapsed >= self.plate_candidate_window
+            and candidate["confidence"] >= self.plate_single_read_confidence
+        )
+        normal_window = elapsed >= self.plate_candidate_window and repeated
+        if fast_repeated or high_single_after_window or normal_window:
+            return candidate
+        return None
+
+    def _emit_plate_read(self, state, binding, candidate, previous, now):
+        height, width = candidate["frame_shape"][:2]
+        zone_id = next((value for value in binding["geometry_ids"]
+                        if value in candidate["containing"]), None)
+        event = self._event("plate_read", candidate["captured_at"], candidate["frame_id"],
+                            binding["use_case_id"], presence_id=state["id"],
+                            track_id=state["track_id"], zone_id=zone_id,
+                            plate_text=candidate["text"], partial=False,
+                            confidence=candidate["confidence"],
+                            plate_bbox_normalized=bbox_normalized(candidate["bbox"], width, height),
+                            supersedes_observation_id=previous[1] if previous else None)
+        media = self._evidence(event, candidate["frame_id"], candidate["frame"],
+                               "frame", None, candidate["frame_shape"], candidate["captured_at"])
+        event["evidence_ids"] = [media[0]["evidence_id"]]
+        self._persist(event, [media])
+        state["plates"][binding["use_case_id"]] = (
+            candidate["text"], event["observation_id"], candidate["confidence"], now,
+        )
+
+    def _emit_plate_outcome(self, state, use_case_id, attempt, outcome="unreadable"):
+        event_time = float(attempt.get("last_captured_at") or time.time())
+        frame_id = attempt.get("last_frame_id")
+        event = self._event("plate_outcome", event_time, frame_id, use_case_id,
+                            presence_id=state["id"], track_id=state["track_id"],
+                            outcome=outcome)
+        evidence = []
+        frame = attempt.get("last_frame")
+        frame_shape = attempt.get("last_frame_shape")
+        if frame is not None and frame_id is not None and frame_shape is not None:
+            media = self._evidence(event, frame_id, frame, "frame", None, frame_shape, event_time)
+            event["evidence_ids"] = [media[0]["evidence_id"]]
+            evidence.append(media)
+        self._persist(event, evidence)
+        state["plate_outcomes"].add(use_case_id)
+
     def _plates(self, packet, now, frame_id):
         height, width = packet.frame.shape[:2]
         for plate in packet.detections:
@@ -694,39 +894,30 @@ class V5EventPipeline:
                 if binding["app"] != "anpr" or not self._matches(binding, "vehicle", containing):
                     continue
                 use_case_id = binding["use_case_id"]
-                attempt = state["plate_attempts"].setdefault(use_case_id, {"started": now, "provisional": False})
+                attempt = self._plate_attempt(state, use_case_id, now)
+                attempt["last_frame"] = packet.frame.copy()
+                attempt["last_frame_id"] = frame_id
+                attempt["last_captured_at"] = now
+                attempt["last_bbox"] = tuple(float(value) for value in plate.bbox)
+                attempt["last_frame_shape"] = packet.frame.shape
                 attempt["provisional"] = attempt["provisional"] or bool(plate.metadata.get("ocr_provisional"))
                 if not text:
                     if (use_case_id not in state["plate_outcomes"]
                             and now - attempt["started"] >= self.plate_outcome_delay):
-                        event = self._event("plate_outcome", now, frame_id, use_case_id,
-                                            presence_id=state["id"], track_id=state["track_id"],
-                                            outcome="unreadable")
-                        media = self._evidence(event, frame_id, packet.frame, "frame", None, packet.frame.shape, now)
-                        event["evidence_ids"] = [media[0]["evidence_id"]]
-                        self._persist(event, [media])
-                        state["plate_outcomes"].add(use_case_id)
+                        self._emit_plate_outcome(state, use_case_id, attempt)
                     continue
-                previous = state["plates"].get(use_case_id)
                 confidence = plate.metadata.get("ocr_confidence", plate.confidence)
                 confidence = max(0.0, min(1.0, float(confidence)))
-                if previous:
-                    previous_text, _previous_observation_id = previous[:2]
-                    previous_confidence = float(previous[2]) if len(previous) > 2 else 0.0
-                    if (text == previous_text
-                            and confidence < previous_confidence + self.plate_confidence_improvement):
-                        continue
-                event = self._event("plate_read", now, frame_id, binding["use_case_id"],
-                                    presence_id=state["id"], track_id=state["track_id"],
-                                    zone_id=next((value for value in binding["geometry_ids"] if value in containing), None),
-                                    plate_text=text, partial=False,
-                                    confidence=confidence,
-                                    plate_bbox_normalized=bbox_normalized(plate.bbox, width, height),
-                                    supersedes_observation_id=previous[1] if previous else None)
-                media = self._evidence(event, frame_id, packet.frame, "frame", None, packet.frame.shape, now)
-                event["evidence_ids"] = [media[0]["evidence_id"]]
-                self._persist(event, [media])
-                state["plates"][use_case_id] = (text, event["observation_id"], confidence)
+                attempt["candidates"].append(
+                    self._plate_candidate(packet, plate, text, confidence, containing, now, frame_id)
+                )
+                previous = state["plates"].get(use_case_id)
+                selected = self._plate_candidate_ready(attempt, previous, now)
+                if selected is not None:
+                    self._emit_plate_read(state, binding, selected, previous, now)
+                    attempt["started"] = now
+                    attempt["candidates"] = []
+                    state["plate_outcomes"].discard(use_case_id)
         for state in self.presences.values():
             if state["kind"] != "vehicle" or state["lost"]:
                 continue
@@ -734,10 +925,16 @@ class V5EventPipeline:
                 if (use_case_id in state["plates"] or use_case_id in state["plate_outcomes"]
                         or now - attempt["started"] < self.plate_outcome_delay):
                     continue
-                self._persist(self._event("plate_outcome", now, frame_id, use_case_id,
-                                          presence_id=state["id"], track_id=state["track_id"],
-                                          outcome="unreadable"))
-                state["plate_outcomes"].add(use_case_id)
+                selected = self._plate_candidate_ready(attempt, None, now)
+                if selected is not None:
+                    binding = next((item for item in self.bindings
+                                    if item["use_case_id"] == use_case_id), None)
+                    if binding is not None:
+                        self._emit_plate_read(state, binding, selected, None, now)
+                        attempt["started"] = now
+                        attempt["candidates"] = []
+                        continue
+                self._emit_plate_outcome(state, use_case_id, attempt)
 
     def _hazards(self, packet, now, frame_id):
         if not getattr(packet, "analytics_state", {}).get("fire_smoke_evaluated", True):

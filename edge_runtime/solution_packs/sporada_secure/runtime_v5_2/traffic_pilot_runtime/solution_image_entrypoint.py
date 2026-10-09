@@ -152,19 +152,11 @@ class WorkerSupervisor:
         })
         command = [sys.executable, "-u", str(self.repo_root / "services" / "worker" / "stream_fleet_openvino.py")]
         new_process = subprocess.Popen(command, cwd=str(self.repo_root), env=env)
-        expected = {f"{camera.name or camera.camera_id}.ready" for camera in desired.cameras}
-        deadline = time.monotonic() + float(os.getenv("WORKER_READY_TIMEOUT_SECONDS", "180"))
+        deadline = time.monotonic() + float(os.getenv("WORKER_SUPERVISOR_STARTUP_SECONDS", "3"))
         while time.monotonic() < deadline:
             if new_process.poll() is not None:
                 raise RuntimeError(f"new worker exited during startup with code {new_process.returncode}")
-            present = {path.name for path in ready_dir.glob("*.ready")}
-            if expected <= present:
-                break
             time.sleep(0.25)
-        else:
-            self._stop_process(new_process)
-            missing = sorted(expected - {path.name for path in ready_dir.glob("*.ready")})
-            raise RuntimeError(f"worker readiness timed out; cameras not initialized: {missing}")
         old_process = self.process
         self.process = new_process
         self._stop_process(old_process)
@@ -305,7 +297,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif parsed_path == "/readyz":
             snap = self.runtime_state.snapshot()
-            self._json({"ready": bool(snap["ready"]), "worker_running": bool(snap["worker_running"])}, 200 if snap["ready"] else 503)
+            payload = {
+                "ready": bool(snap["ready"]),
+                "worker_running": bool(snap["worker_running"]),
+                "per_camera_state": _per_camera_state(snap),
+            }
+            self._json(payload, 200 if snap["ready"] else 503)
         elif parsed_path == "/metrics":
             self._text(_metrics(self.runtime_state), "text/plain; version=0.0.4; charset=utf-8")
         elif parsed_path == "/events":
@@ -398,6 +395,54 @@ def _tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
     return payloads
+
+
+def _per_camera_state(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    plan = snap.get("plan") or {}
+    camera_ids = [
+        str(camera.get("camera_id"))
+        for camera in plan.get("cameras") or []
+        if camera.get("camera_id")
+    ]
+    latest_health: dict[str, dict[str, Any]] = {}
+    events_path = Path(os.getenv("ANALYTICS_EVENT_LOG_PATH", "/state/events/analytics.jsonl"))
+    for event in _tail_jsonl(events_path, 500):
+        if event.get("event_type") != "camera_health":
+            continue
+        camera_id = str(event.get("camera_id") or "")
+        if camera_id:
+            latest_health[camera_id] = event
+    state_root = Path(os.getenv("APEXFABRIC_STATE_ROOT", "/state"))
+    outbox_root = state_root / "sentinel_v5_2" / "outbox"
+    for camera_id in camera_ids:
+        camera_outbox = outbox_root / camera_id
+        if not camera_outbox.exists():
+            continue
+        for path in sorted(camera_outbox.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:500]:
+            try:
+                event = json.loads(path.read_text(encoding="utf-8")).get("observation") or {}
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if event.get("event_type") != "camera_health":
+                continue
+            current = latest_health.get(camera_id) or {}
+            if str(event.get("observed_at") or "") >= str(current.get("observed_at") or current.get("as_of") or ""):
+                latest_health[camera_id] = event
+            break
+    states = []
+    for camera_id in camera_ids:
+        health = latest_health.get(camera_id) or {}
+        state = str(health.get("state") or "degraded")
+        reason = str(health.get("reason") or "worker_starting")
+        states.append({
+            "camera_id": camera_id,
+            "state": state,
+            "reason": reason,
+            "last_reliable_at": health.get("last_reliable_at"),
+            "as_of": health.get("as_of") or health.get("observed_at"),
+            "retrying": state != "healthy",
+        })
+    return states
 
 
 def _metrics(state: RuntimeState) -> str:
@@ -745,7 +790,7 @@ def _utc_timestamp(epoch: float) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Sentinel CV V5.2 solution image")
+    parser = argparse.ArgumentParser(description="Run the Sentinel CV V6 solution image")
     parser.add_argument("--repo-root", default=os.getenv("TRAFFIC_PILOT_ROOT", "/opt/traffic-pilot"))
     parser.add_argument("--desired-state", default=os.getenv("DESIRED_STATE_PATH", "/configs/desired_state.json"))
     parser.add_argument("--secrets-root", default=os.getenv("APEXFABRIC_SECRETS_ROOT", "/run/secrets/sentinel/cameras"))

@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/opt/traffic-pilot \
     TRAFFIC_PILOT_ROOT=/opt/traffic-pilot \
     SOLUTION_PACK=sentinel-cv-runtime \
-    APEXFABRIC_CONTRACT_VERSION=v5.2 \
+    APEXFABRIC_CONTRACT_VERSION=v6 \
     APEXFABRIC_SECRETS_ROOT=/run/secrets/sentinel/cameras \
     APEXFABRIC_STATE_ROOT=/state \
     APEXFABRIC_GENERATED_DIR=/tmp/sentinel/generated \
@@ -59,14 +59,15 @@ RUN python -m pip install --break-system-packages --no-cache-dir jsonschema==4.2
     && test -f /models/surveillance/gaitbase_int8.xml \
     && test "$(id -u apexruntime)" = "10001"
 
-ARG IMAGE_VERSION=2026.10.07-v5.2-dev5
+ARG IMAGE_VERSION=2026.10.09-v6-dev5
 ARG INTEL_TRAFFIC_RUNTIME_BASE_DIGEST=unresolved
 
 LABEL org.opencontainers.image.source="https://github.com/kiranmaibattu-cyber/sentry_cv" \
       org.opencontainers.image.title="Sentinel CV Runtime" \
-      org.opencontainers.image.description="V5.2 development runtime for Intel 285H" \
+      org.opencontainers.image.description="V6 development runtime for Intel 285H with V5.2 wire payloads" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
-      io.apexfabric.contract.version="5.2" \
+      io.apexfabric.contract.version="6.0" \
+      io.apexfabric.wire.schema.version="5.2" \
       io.apexfabric.contract.status="development" \
       io.apexfabric.hardware.profile="intel-285h" \
       io.apexfabric.image.role="solution-runtime" \

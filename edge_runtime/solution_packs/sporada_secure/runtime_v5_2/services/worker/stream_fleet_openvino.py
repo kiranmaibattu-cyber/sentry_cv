@@ -465,8 +465,13 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
                     dets.append(pd)
         smoke_evaluated = smoke_fire is not None and smoke_fire.should_process(fidx)
         if smoke_evaluated:
-            dets.extend(smoke_fire.detect(frame))
+            try:
+                dets.extend(smoke_fire.detect(frame))
+            except RuntimeError as exc:
+                smoke_evaluated = False
+                log.warning("cam[%s] fire/smoke inference skipped: %s", name, exc)
         packet = FramePacket(index=fidx, name=name, frame=frame,
+                             frame_observed_at=frame_received_at,
                              frame_received_at=frame_received_at)
         packet.analytics_state["fire_smoke_evaluated"] = smoke_evaluated
         packet.detections = dets

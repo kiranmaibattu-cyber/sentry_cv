@@ -114,8 +114,8 @@ an Event is created under overload; coverage gaps are reported.
 ## Separate production policy
 
 The edge's detection, quality, temporal confirmation, reassociation, best-shot,
-and dedup algorithms are specified and calibrated outside this wire contract
-in `../../V4_1_EVENT_PRODUCTION_POLICY_WORKING.md`. This contract states only
+adaptive-gate, and dedup algorithms are specified and calibrated outside this
+wire contract in `../../SENTINEL_V5_2_PRODUCTION_POLICY.md`. This contract states only
 the meanings Management can rely on and the inputs/outputs crossing the
 boundary. Management sets only the scene sampling interval in desired state;
 presence/count freshness cadence remains edge policy. The example 2-second

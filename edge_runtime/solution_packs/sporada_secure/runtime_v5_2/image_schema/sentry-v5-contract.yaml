@@ -21,7 +21,7 @@ boundary:
   bodyAndGait: candidate_association_only
   actionMatchingAndPolicyClips: deferred
   managementToEdgeRecheck: deferred
-  internalProductionPolicy: ../../V4_1_EVENT_PRODUCTION_POLICY_WORKING.md
+  internalProductionPolicy: ../../SENTINEL_V5_2_PRODUCTION_POLICY.md
 
 desiredState:
   path: /configs/desired_state.json

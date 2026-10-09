@@ -25,7 +25,7 @@ from detectors.backends.openvino_smoke_fire import _device_with_fallback
 import decode
 from stream_fleet_openvino import require_accelerator_device
 from traffic_pilot_runtime.desired_state import DesiredStateValidator
-from traffic_pilot_runtime.solution_image_entrypoint import _hot_reload_signature
+from traffic_pilot_runtime.solution_image_entrypoint import _hot_reload_signature, _per_camera_state
 
 
 class Scene:
@@ -40,6 +40,24 @@ class Body:
         vector = np.zeros(384, np.float32)
         vector[0] = 1
         return np.stack([vector for _ in crops])
+
+
+class Gait:
+    def __init__(self):
+        self.buffers = {}
+        self.buffer_times = {}
+
+    def collect(self, frame, people, camera_id, keys, captured_at=None):
+        vector = np.zeros(4096, np.float32)
+        vector[0] = 1
+        output = {}
+        for person in people:
+            track_id = int(person.metadata["track_id"])
+            key = keys[track_id]
+            self.buffers[key] = [np.ones((64, 44), np.uint8) for _ in range(24)]
+            self.buffer_times[key] = [float(captured_at or 0.0) - 1.0, float(captured_at or 0.0)]
+            output[track_id] = vector
+        return output
 
 
 def packet(index, boxes=(), plate=None):
@@ -73,6 +91,8 @@ def events(tmp_path):
 
 def test_presence_count_scene_and_anpr(tmp_path, monkeypatch):
     monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v5_events, "time", clock)
     zone = {"id": "parking", "name": "Parking", "poly": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]}
     bindings = [binding("presence", "vehicle_presence", "geometry", ["parking"],
                         embedding_profile_ids=["siglip2-base-v1"]),
@@ -82,8 +102,9 @@ def test_presence_count_scene_and_anpr(tmp_path, monkeypatch):
                         embedding_profile_ids=["siglip2-base-v1"], sample_interval_seconds=2)]
     pipeline = V5EventPipeline("cam", config(bindings, [zone]), scene=Scene())
     box = (20, 20, 70, 75)
-    for index in range(1, 5):
-        pipeline.process(packet(index, [("car", 1, box)], "KA01AB1234" if index == 3 else None))
+    for index in range(1, 6):
+        pipeline.process(packet(index, [("car", 1, box)], "KA01AB1234" if index >= 4 else None))
+        clock.value += 1
     observations = events(tmp_path)
     assert len([item for item in observations if item["event_type"] == "object_present"]) == 1
     assert not any(item["event_type"] == "zone_entry" for item in observations)
@@ -154,6 +175,18 @@ def test_frame_receive_time_is_used_for_observations(tmp_path, monkeypatch):
         pipeline.process(item)
     present = next(item for item in events(tmp_path) if item["event_type"] == "object_present")
     assert present["observed_at"] == "1970-01-01T00:01:40.200000Z"
+
+
+def test_frame_observed_time_precedes_receive_time_when_available(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    pipeline = V5EventPipeline("cam", config([binding("presence", "vehicle_presence")]))
+    for index in range(3):
+        item = packet(index, [("car", 1, (20, 20, 70, 75))])
+        item.frame_observed_at = 90.0 + index * .1
+        item.frame_received_at = 100.0 + index * .1
+        pipeline.process(item)
+    present = next(item for item in events(tmp_path) if item["event_type"] == "object_present")
+    assert present["observed_at"] == "1970-01-01T00:01:30.200000Z"
 
 
 def test_same_track_recovery_is_explicit(tmp_path, monkeypatch):
@@ -249,6 +282,41 @@ def test_shared_polygon_fans_out_with_one_episode(tmp_path, monkeypatch):
     assert len(first) == 1 and first[0]["use_case_id"] == "a"
 
 
+def test_dwell_episode_updates_inside_time_and_completes_only_on_positive_exit(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v5_events, "time", clock)
+    zone = {"id": "parking", "name": "Parking", "poly": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]}
+    pipeline = V5EventPipeline("cam", config([binding("presence", "vehicle_presence", "geometry", ["parking"])], [zone]))
+    outside = (20, 20, 70, 95)
+    inside = (20, 20, 70, 75)
+    for index in range(3):
+        pipeline.process(packet(index, [("car", 1, outside)]))
+        clock.value += 1
+    pipeline.process(packet(3, [("car", 1, inside)]))
+    clock.value += 1
+    pipeline.process(packet(4, [("car", 1, inside)]))
+    clock.value += 5
+    pipeline.process(packet(5, [("car", 1, inside)]))
+    output = events(tmp_path)
+    entry = next(item for item in output if item["event_type"] == "zone_entry")
+    clock.value += 61
+    pipeline.process(packet(6, [("car", 1, inside)]))
+    present = next(item for item in events(tmp_path)
+                   if item["event_type"] == "object_present" and item["reason"] == "periodic")
+    episode = next(item for item in present["zone_episodes"] if item["zone_id"] == "parking")
+    assert episode["zone_episode_id"] == entry["zone_episode_id"]
+    assert episode["last_confirmed_inside_at"] == "1970-01-01T00:02:50Z"
+    clock.value += 5
+    pipeline.process(packet(7))
+    assert not any(item["event_type"] == "zone_exit" for item in events(tmp_path))
+    pipeline.process(packet(8, [("car", 1, outside)]))
+    clock.value += 1
+    pipeline.process(packet(9, [("car", 1, outside)]))
+    exits = [item for item in events(tmp_path) if item["event_type"] == "zone_exit"]
+    assert len(exits) == 1 and exits[0]["zone_episode_id"] == entry["zone_episode_id"]
+
+
 def test_face_and_body_are_independent_samples(tmp_path, monkeypatch):
     monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
     clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
@@ -269,6 +337,31 @@ def test_face_and_body_are_independent_samples(tmp_path, monkeypatch):
     features = [item for item in output if item["event_type"] == "person_feature_sample"]
     assert {item["kind"] for item in features} == {"face", "body"}
     assert len({item["presence_id"] for item in features}) == 1
+
+
+def test_gait_sample_emits_sequence_metadata_and_embedding(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v5_events, "time", clock)
+    identity = binding("identity", "person_identity", kind="person",
+                       embedding_profile_ids=["gaitbase-v18.1"])
+    pipeline = V5EventPipeline("cam", config([identity]), gait=Gait())
+    for index in range(4):
+        pipeline.process(packet(index, [("pedestrian", 2, (20, 10, 80, 90))]))
+        clock.value += .5
+    output = events(tmp_path)
+    gait = next(item for item in output if item.get("kind") == "gait")
+    assert gait["profile_id"] == "gaitbase-v18.1"
+    assert gait["source_frame_id"] == "cam:3"
+    assert gait["quality"] == pytest.approx(0.8)
+    record = json.loads(next(path for path in (tmp_path / "sentinel_v5_2" / "outbox" / "cam").glob("*.json")
+                             if json.loads(path.read_text())["observation"]["observation_id"] == gait["observation_id"]).read_text())
+    embedding = record["embeddings"][0]
+    assert embedding["kind"] == "gait"
+    assert len(embedding["vector"]) == 4096
+    assert embedding["usable_silhouette_count"] == 24
+    assert embedding["sequence_started_at"] == "1970-01-01T00:01:40.500000Z"
+    assert embedding["sequence_ended_at"] == "1970-01-01T00:01:41.500000Z"
 
 
 def test_face_window_selects_best_original_frame(tmp_path, monkeypatch):
@@ -421,9 +514,30 @@ def test_plate_attempt_has_one_failure_outcome_and_later_correction(tmp_path, mo
     pipeline.process(packet(4, [("car", 1, (20, 20, 70, 75))]))
     outcomes = [item for item in events(tmp_path) if item["event_type"] == "plate_outcome"]
     assert len(outcomes) == 2 and all(item["outcome"] == "unreadable" for item in outcomes)
-    pipeline.process(packet(5, [("car", 1, (20, 20, 70, 75))], "KA01AB1234"))
+    for outcome in outcomes:
+        record = json.loads(next(path for path in (tmp_path / "sentinel_v5_2" / "outbox" / "cam").glob("*.json")
+                                 if json.loads(path.read_text())["observation"]["observation_id"] == outcome["observation_id"]).read_text())
+        assert record["evidence"][0]["metadata"]["evidence_type"] == "frame"
+    first_read = packet(5, [("car", 1, (20, 20, 70, 75))])
+    first_read.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                                 confidence=.8,
+                                                 metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .35},
+                                                 parent_id=1))
+    pipeline.process(first_read)
     clock.value += .1
-    pipeline.process(packet(6, [("car", 1, (20, 20, 70, 75))], "KA01AB1235"))
+    selected_read = packet(6, [("car", 1, (20, 20, 70, 75))])
+    selected_read.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                                    confidence=.8,
+                                                    metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .80},
+                                                    parent_id=1))
+    pipeline.process(selected_read)
+    clock.value += 6
+    corrected_read = packet(7, [("car", 1, (20, 20, 70, 75))])
+    corrected_read.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                                     confidence=.8,
+                                                     metadata={"ocr_text": "KA01AB1235", "ocr_confidence": .95},
+                                                     parent_id=1))
+    pipeline.process(corrected_read)
     reads = [item for item in events(tmp_path) if item["event_type"] == "plate_read"]
     assert len(reads) == 4
     by_binding = {key: [item for item in reads if item["use_case_id"] == key]
@@ -450,6 +564,8 @@ def test_anpr_rejects_below_range_read_but_keeps_provisional():
 
 def test_anpr_improved_confidence_supersedes_same_plate(tmp_path, monkeypatch):
     monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v5_events, "time", clock)
     pipeline = V5EventPipeline("cam", config([binding("plate", "anpr")]))
     for index in range(3):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
@@ -464,10 +580,45 @@ def test_anpr_improved_confidence_supersedes_same_plate(tmp_path, monkeypatch):
                                            metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .45},
                                            parent_id=1))
     pipeline.process(low)
+    clock.value += 2.1
+    pipeline.process(low)
+    clock.value += 6
     pipeline.process(high)
-    reads = [item for item in events(tmp_path) if item["event_type"] == "plate_read"]
+    reads = sorted((item for item in events(tmp_path) if item["event_type"] == "plate_read"),
+                   key=lambda item: item["confidence"])
     assert [item["confidence"] for item in reads] == [.30, .45]
     assert reads[1]["supersedes_observation_id"] == reads[0]["observation_id"]
+
+
+def test_anpr_suppresses_noisy_alternate_plate_for_same_presence(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v5_events, "time", clock)
+    pipeline = V5EventPipeline("cam", config([binding("plate", "anpr")]))
+    for index in range(3):
+        pipeline.process(packet(index, [("car", 9, (20, 20, 70, 75))]))
+        clock.value += .1
+    good = packet(3, [("car", 9, (20, 20, 70, 75))])
+    good.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                           confidence=.9,
+                                           metadata={"ocr_text": "KA03NP4277", "ocr_confidence": .95},
+                                           parent_id=9))
+    pipeline.process(good)
+    for index, (text, confidence) in enumerate([
+        ("KA03BP4277", .91),
+        ("KA1TBB4377", .73),
+        ("AP1BBD4137", .51),
+        ("AP22A8777", .47),
+    ], start=4):
+        clock.value += 6
+        noisy = packet(index, [("car", 9, (20, 20, 70, 75))])
+        noisy.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+                                                confidence=.9,
+                                                metadata={"ocr_text": text, "ocr_confidence": confidence},
+                                                parent_id=9))
+        pipeline.process(noisy)
+    reads = [item for item in events(tmp_path) if item["event_type"] == "plate_read"]
+    assert [item["plate_text"] for item in reads] == ["KA03NP4277"]
 
 
 def test_delivery_orders_event_evidence_embedding(tmp_path, monkeypatch):
@@ -579,7 +730,7 @@ def test_desired_state_rejects_stale_fields(tmp_path):
     (secret_root / "cam.url").write_text("rtsp://127.0.0.1/live")
     validator = DesiredStateValidator(secret_root)
     validator.schema["$defs"]["camera"]["properties"]["source"]["pattern"] = r"^file:.*cam\.url$"
-    data = {"contract": "sentry-v5", "schema_version": "5.2", "edge_id": "edge",
+    data = {"contract": "sentry-v6", "schema_version": "5.2", "edge_id": "edge",
             "deployment_id": "test", "revision": 1,
             "cameras": [{"camera_id": "cam", "source": f"file:{secret_root / 'cam.url'}", "fps": 8,
                          "bindings": [binding("count", "vehicle_counting")]}]}
@@ -591,3 +742,42 @@ def test_desired_state_rejects_stale_fields(tmp_path):
         pass
     else:
         raise AssertionError("stale apps list was accepted")
+
+
+def test_v6_ready_state_reports_camera_retrying_until_health_event(tmp_path, monkeypatch):
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setenv("ANALYTICS_EVENT_LOG_PATH", str(events_path))
+    snap = {"plan": {"cameras": [{"camera_id": "cam-a"}, {"camera_id": "cam-b"}]}}
+    assert _per_camera_state(snap) == [
+        {"camera_id": "cam-a", "state": "degraded", "reason": "worker_starting",
+         "last_reliable_at": None, "as_of": None, "retrying": True},
+        {"camera_id": "cam-b", "state": "degraded", "reason": "worker_starting",
+         "last_reliable_at": None, "as_of": None, "retrying": True},
+    ]
+    events_path.write_text(json.dumps({
+        "event_type": "camera_health", "camera_id": "cam-a", "state": "healthy",
+        "reason": "none", "as_of": "2026-10-09T10:00:00Z",
+        "last_reliable_at": "2026-10-09T10:00:00Z",
+    }) + "\n", encoding="utf-8")
+    states = {item["camera_id"]: item for item in _per_camera_state(snap)}
+    assert states["cam-a"]["state"] == "healthy"
+    assert states["cam-a"]["retrying"] is False
+    assert states["cam-b"]["reason"] == "worker_starting"
+
+
+def test_v6_ready_state_reads_camera_health_from_v5_outbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    snap = {"plan": {"cameras": [{"camera_id": "cam"}]}}
+    outbox = tmp_path / "sentinel_v5_2" / "outbox" / "cam"
+    outbox.mkdir(parents=True)
+    (outbox / "health.json").write_text(json.dumps({"observation": {
+        "event_type": "camera_health", "camera_id": "cam", "state": "healthy",
+        "reason": "none", "observed_at": "2026-10-09T10:00:00Z",
+        "as_of": "2026-10-09T10:00:00Z",
+        "last_reliable_at": "2026-10-09T10:00:00Z",
+    }}), encoding="utf-8")
+    assert _per_camera_state(snap) == [
+        {"camera_id": "cam", "state": "healthy", "reason": "none",
+         "last_reliable_at": "2026-10-09T10:00:00Z",
+         "as_of": "2026-10-09T10:00:00Z", "retrying": False}
+    ]

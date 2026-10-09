@@ -1,8 +1,14 @@
-# Proposed V5-compatible boundary revision. No released image claims conformance.
-name: sentry-v5
-schemaVersion: "5.2"
+# Complete V6 CV/Management boundary contract. No released image claims conformance.
+name: sentry-v6
+schemaVersion: "6.0"
 status: draft-for-edge-and-management-review
-base: ../sentry-v5-contract.yaml
+wireSchemaVersion: "5.2"
+compatibility:
+  basedOn: sentry-v5
+  payloadFieldsChanged: false
+  newEventTypes: none
+  changedEventFields: none
+  desiredStateContractMarker: sentry-v6
 hardwareProfile: intel-core-ultra-285h
 architectures: [amd64]
 schemas:
@@ -29,7 +35,7 @@ desiredState:
   apply: validate_whole_revision_then_atomically_apply
   invalid: keep_last_valid_and_report_not_ready
   source: mounted_camera_url_secret_only
-  apps: v5_app_catalog_selected_only_by_bindings
+  apps: v6_app_catalog_selected_only_by_bindings
   geometry: reusable_camera_local_polygons_and_lines
   binding: one_use_case_id_per_app_instance_with_full_frame_or_geometry_scope
   outputProfiles: profile_ids_enable_attempts_not_guaranteed_results
@@ -42,11 +48,11 @@ outputSemantics:
   zone_exit: positive_inside_to_outside_transition_only
   line_cross: validated_directional_crossing_is_separate_from_zone_exit
   track_lost: temporary_unobserved_not_departure
-  presence_recovered: positive_reobservation_after_track_loss_same_or_reassociated_track_id
+  presence_recovered: same_presence_after_qualified_camera_local_track_reassociation
   presence_ended_unknown: lost_without_positive_exit_and_not_recovered
   zone_count: visible_now_total_at_as_of_not_cumulative_arrivals_or_guaranteed_occupancy
-  plate_read: best_in_range_readable_text_or_material_confidence_improvement_with_source_frame_and_plate_bbox
-  plate_outcome: unreadable_when_plate_candidate_cannot_be_read_in_range
+  plate_read: confirmed_text_with_source_frame_and_plate_bbox
+  plate_outcome: unreadable_or_timed_out_without_inventing_text
   person_feature_sample: one_selected_face_body_or_gait_artifact_set_for_a_presence
   scene_sample: selected_decoded_frame_and_matching_scene_vector
   fire_smoke_suspected: suspected_hazard_not_confirmed_incident
@@ -57,7 +63,7 @@ subjectEventOwnership:
   eligibility: binding_enabled_and_full_frame_or_subject_in_bound_polygon_at_first_confirmation
   priority: presence_app_before_person_identity_or_anpr
   tieBreak: lexicographically_smallest_use_case_id
-  selectedAt: first_confirmed_presence_matching_an_eligible_binding
+  selectedAt: first_confirmed_presence
   stableWhileBindingEnabled: true
   onOwnerDisabledByNewRevision: reselect_without_another_first_seen_event
   useCaseIdMeaning: origin_owner_not_a_claim_of_current_zone_membership
@@ -109,10 +115,38 @@ management:
   ack: status_created_stored_or_existing_plus_matching_id
 runtimeEndpoints:
   port: 8080
-  health: GET /healthz
-  readiness: GET /readyz
+  health:
+    route: GET /healthz
+    readyWhen: process_and_http_event_loop_are_alive
+  readiness:
+    route: GET /readyz
+    readyWhen:
+      - desired_state_is_valid
+      - shared_models_are_loaded
+      - inference_scheduler_is_running
+      - per_camera_supervisors_and_recovery_loops_are_running
+    mustNotRequire: every_configured_camera_is_healthy
+    responseIncludes:
+      - ready
+      - worker_running
+      - per_camera_state_reason_last_reliable_at_and_retrying
   metrics: GET /metrics
   recheck: deferred
+runtimeAvailability:
+  cameraIsolation: one_failed_camera_must_not_stop_decode_inference_or_delivery_for_healthy_cameras
+  startup: shared_models_and_worker_start_independently_of_camera_connectivity
+  retry: failed_cameras_retry_independently_with_bounded_backoff_and_rejoin_without_process_restart
+  cameraHealth: emit_transition_and_freshness_heartbeat_per_camera
+  recovery: recovered_camera_rejoins_without_pod_restart_and_starts_a_new_stream_session
+  outageSemantics:
+    - failed_camera_tracks_become_unknown_not_departed
+    - failed_camera_counts_become_unknown_not_zero
+    - healthy_cameras_continue_events_evidence_embeddings_and_delivery
+managementCompatibility:
+  cameraHealthStates: [healthy, degraded, unavailable]
+  staleHeartbeat: surface_as_unavailable_with_reason_heartbeat_silence
+  dashboard: show_per_camera_state_reason_and_last_reliable_at
+  deploymentStatus: remain_ready_when_runtime_is_operational_even_if_one_or_more_cameras_are_unavailable
 resources:
   recommendedMaxCameraStreams: 4
   hardCapCameraStreams: 8
@@ -120,6 +154,10 @@ resources:
   memory: {request: 8Gi, limit: 14Gi}
   processUid: 10001
   readOnlyRootFilesystem: true
+  writableMounts:
+    - {path: /plans, storage: ephemeral, purpose: generated_runtime_plans}
+    - {path: /tmp/sentinel, storage: ephemeral, purpose: generated_config_and_cache}
+    - {path: /state, storage: persistent, purpose: durable_delivery_and_evidence}
   devices: [/dev/dri, /dev/accel]
 delivery:
   order: [observation, evidence, embedding]
