@@ -783,6 +783,19 @@ the view produced repeated person loss/recovery transitions that need visual
 ground-truth review. ANPR, crossing, hazard transitions, and a qualifying face
 sample were not present in this stream and therefore were not trigger-tested.
 
+### 10.7 Remove Unused Vehicle Runtime Manifest
+
+Dev20 removes `vehicle_yolo26n_fp16_dynamic.runtime.json` from source and from
+the image. No runtime code consumed that file; OpenVINO loads the XML/BIN pair,
+and the nine-class mapping remains enforced and tested at the detector boundary.
+The model hashes and inference behavior are unchanged from dev19.
+
+```text
+ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20
+image ID: 5e9f55d489315737b089bea681788b78a1898d9244c67979d3d81bde60b0e2b6
+registry digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
+```
+
 ## 11. Anti-Regression Checklist
 
 Before changing the runtime, preserve these decisions:

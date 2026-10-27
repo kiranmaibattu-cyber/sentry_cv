@@ -1,12 +1,12 @@
 # Sentinel V6.0 Development Image
 
-Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev19`
+Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20`
 
-Image ID: `79a70ea03e6aa6e4068d777427c345417a996cf37a702fef16292c5e8611aee5`
+Image ID: `5e9f55d489315737b089bea681788b78a1898d9244c67979d3d81bde60b0e2b6`
 
-Local digest: `sha256:b227eec52224caac67890623021ad1935fcc57db22ff49bb39248b3c3f9eef3a`
+Local digest: `sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854`
 
-Registry digest: `sha256:b227eec52224caac67890623021ad1935fcc57db22ff49bb39248b3c3f9eef3a`
+Registry digest: `sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854`
 
 Publication status: pushed to the personal `kiranmaibattu-cyber` GHCR namespace.
 
@@ -23,6 +23,9 @@ deferred by the contract.
 ## Verified
 
 - V6 package validator passes: 5 schemas and 16 representative Event examples.
+- Dev20 removes the unused dynamic-model runtime JSON from the repository and
+  image. The runtime model consists of the XML/BIN pair; their hashes and the
+  detector class mapping are unchanged from the tested dev19 build.
 - Dev19 replaces the static 80-class vehicle IR with the supplied dynamic-batch
   nine-class FP16 IR. The per-camera detector fixes batch 1 before GPU
   compilation and does not request `f32` inference precision. In-image

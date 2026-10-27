@@ -11,11 +11,11 @@ container startup.
 ## Current V6 Image Candidate
 
 ```text
-ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev19
-image ID: 79a70ea03e6aa6e4068d777427c345417a996cf37a702fef16292c5e8611aee5
-local digest: sha256:b227eec52224caac67890623021ad1935fcc57db22ff49bb39248b3c3f9eef3a
+ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20
+image ID: 5e9f55d489315737b089bea681788b78a1898d9244c67979d3d81bde60b0e2b6
+local digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
 publication status: published development image in personal GHCR
-registry digest: sha256:b227eec52224caac67890623021ad1935fcc57db22ff49bb39248b3c3f9eef3a
+registry digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
 ```
 
 This is the first candidate in this repository with a true V6 wire boundary.
@@ -30,7 +30,10 @@ The image is built from:
 - `newdetails/sentry-v6`
 - baked OpenVINO/ONNX model files under `models/`
 
-Dev19 replaces the static 80-class vehicle IR with the supplied dynamic-batch
+Dev20 uses the dynamic-batch nine-class vehicle IR introduced in dev19 and
+removes the unused `vehicle_yolo26n_fp16_dynamic.runtime.json` manifest. The
+runtime loads only the model XML/BIN and keeps the class mapping at the tested
+detector boundary. Dev19 replaced the static 80-class vehicle IR with the supplied dynamic-batch
 nine-class vehicle IR. The current per-camera detector fixes batch 1 before GPU
 compilation and uses the GPU's FP16 execution path without an explicit `f32`
 hint. A future batching worker must compile a separate fixed-size model instance
@@ -106,14 +109,14 @@ Build the GHCR image:
 
 ```bash
 SENTINEL_IMAGE_REPOSITORY=ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime \
-SENTINEL_IMAGE_VERSION=2026.10.27-v6-dev19 \
+SENTINEL_IMAGE_VERSION=2026.10.27-v6-dev20 \
 ./scripts/build_sentinel_v6_image.sh
 ```
 
 Push it:
 
 ```bash
-podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev19
+podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20
 ```
 
 ## Contract And Design Docs
