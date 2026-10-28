@@ -15,7 +15,8 @@ includes:
 - `desired-state.schema.json` and `desired-state.example.json`.
 - `observation.schema.json` and `observation-examples.json`.
 - `evidence.schema.json` and `evidence.example.json`.
-- `embedding.schema.json` and `acknowledgement.schema.json`.
+- `embedding.schema.json`, `acknowledgement.schema.json`, and
+  `acknowledgement.example.json`.
 - `validate_contract.py`: schema and representative boundary validation.
 - `release.yaml`: runtime-image publication status.
 
@@ -27,9 +28,14 @@ python3 validate_contract.py
 
 The runtime also defines camera fault isolation. A configured camera that
 cannot decode becomes `unavailable`, retries in its own supervisor, and leaves
-healthy cameras processing. `/readyz` reports the runtime ready when shared
-models, the inference scheduler, and recovery loops are operational; it does
-not require every camera to be healthy.
+healthy cameras processing. `/readyz` reports the runtime ready when the
+HTTP/runtime supervisor and per-camera recovery loops are operational; it
+does not require every camera or every camera-local model process to be healthy.
+
+One desired-state revision may configure 1 through 50 cameras. This is a
+configuration and supervision limit, not an unconditional FPS claim. Release
+validation must report resolution, requested FPS, enabled models, measured
+throughput and memory for each tested camera count.
 
 The recent management changes are compatible consumers of this behavior:
 camera-health state uses the existing `healthy`, `degraded`, and `unavailable`

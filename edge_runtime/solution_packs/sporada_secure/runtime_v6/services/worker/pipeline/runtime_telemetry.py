@@ -85,6 +85,7 @@ class CameraTelemetry:
         self._window_device_calls: dict[str, int] = defaultdict(int)
         self._proc = psutil.Process()
         self._proc.cpu_percent(interval=None)
+        self.latest_snapshot: dict[str, Any] | None = None
         self.flush(force=True)
 
     def count(self, name: str, value: int = 1) -> None:
@@ -149,6 +150,7 @@ class CameraTelemetry:
         with self._lock:
             window_seconds = max(1e-6, now_mono - self._window_started)
             payload = self._snapshot_locked(window_seconds)
+            self.latest_snapshot = payload
             self._window_started = now_mono
             self._last_flush = now_mono
             self._window_counters.clear()

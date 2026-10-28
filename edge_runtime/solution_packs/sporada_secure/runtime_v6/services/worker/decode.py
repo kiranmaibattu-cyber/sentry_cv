@@ -14,16 +14,21 @@ hardware decode; OV_DECODE_HW=0 is rejected instead of silently using libav.
 """
 from __future__ import annotations
 
+from collections import deque
 import ctypes
 import json
 import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 
 import cv2
 import numpy as np
+
+from pipeline.runtime_status import DecoderRuntimeStatus
+from pipeline.structured_logging import log_event, sanitize_text, set_stream_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +65,7 @@ def _network_input_options(uri: str, *, probe: bool) -> list[str]:
     return []
 
 
-def _probe_resolution(uri: str) -> tuple[int, int]:
+def _probe_resolution(uri: str, *, camera_id: str = "unknown") -> tuple[int, int]:
     args = ["ffprobe", "-v", "error"]
     args += _network_input_options(uri, probe=True)
     args += ["-select_streams", "v:0", "-show_entries", "stream=width,height",
@@ -72,11 +77,25 @@ def _probe_resolution(uri: str) -> tuple[int, int]:
                                     check=True, timeout=35)
             return _parse_probe_resolution(result.stdout)
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as exc:
+            stderr = sanitize_text(getattr(exc, "stderr", "") or "", limit=2048)
             if attempt == attempts:
+                log_event(
+                    logger, logging.ERROR, "decoder_probe_exhausted",
+                    "resolution probe failed after all attempts",
+                    camera_id=camera_id, attempt=attempt,
+                    maximum_attempts=attempts,
+                    retry_reason=type(exc).__name__,
+                    sanitized_stderr=stderr or None,
+                )
                 raise RuntimeError(f"could not probe stream after {attempts} attempts") from exc
             delay = min(2 ** attempt, 10)
-            logger.warning("resolution probe failed (attempt %d/%d); retrying in %ss",
-                           attempt, attempts, delay)
+            log_event(
+                logger, logging.WARNING, "decoder_probe_retry",
+                "resolution probe failed; retry scheduled",
+                camera_id=camera_id, attempt=attempt, maximum_attempts=attempts,
+                retry_reason=type(exc).__name__, retry_backoff_seconds=delay,
+                sanitized_stderr=stderr or None,
+            )
             time.sleep(delay)
 
 
@@ -120,7 +139,8 @@ class FfmpegDecoder:
     """Iterate BGR frames from one source at `fps`. HW (VA-API/NV12) by default;
     reconnects RTSP and loops files. Iterating yields numpy BGR (H,W,3)."""
 
-    def __init__(self, uri: str, fps: int = 12, name: str = "?", status_callback=None):
+    def __init__(self, uri: str, fps: int = 12, name: str = "?", status_callback=None,
+                 stream_session_id: str | None = None):
         if not _HW:
             raise RuntimeError("V6.0 requires VA-API hardware decode (OV_DECODE_HW must not be 0)")
         self.uri = uri
@@ -128,18 +148,31 @@ class FfmpegDecoder:
         self.name = name
         self.is_stream = uri.startswith(STREAM_SCHEMES)
         self.status_callback = status_callback
+        self.stream_session_id = str(stream_session_id or "unknown")
+        self.runtime_status = DecoderRuntimeStatus(self.name, self.stream_session_id)
         self._probe_failed = False
+        self._stderr_lines: deque[str] = deque(maxlen=40)
+        self._stderr_thread: threading.Thread | None = None
         backoff = 1.0
         while True:
             try:
-                self.w, self.h = _probe_resolution(uri)
+                self.runtime_status.update(state="probing", reason="resolution_probe")
+                self.w, self.h = _probe_resolution(uri, camera_id=self.name)
                 break
-            except Exception:
+            except Exception as exc:
                 if not self.is_stream:
                     raise
                 self._probe_failed = True
                 self._status("unavailable", "stream_disconnected")
-                logger.warning("decode[%s] probe failed; retrying in %.0fs", self.name, backoff)
+                self.runtime_status.increment(
+                    "decoder_errors", state="unavailable", reason="probe_failed",
+                    retry_reason=type(exc).__name__, retry_backoff_seconds=backoff,
+                )
+                log_event(
+                    logger, logging.WARNING, "decoder_probe_failed",
+                    "decoder probe failed; retry scheduled",
+                    retry_reason=type(exc).__name__, retry_backoff_seconds=backoff,
+                )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 10.0)
         self._nv12 = _HW
@@ -148,12 +181,45 @@ class FfmpegDecoder:
         self._proc: subprocess.Popen | None = None
 
     def _spawn(self) -> None:
+        self._stderr_lines.clear()
         self._proc = subprocess.Popen(
             _ffmpeg_cmd(self.uri, self.fps, self.is_stream),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             preexec_fn=_die_with_parent,
         )
-        logger.info("decode[%s] %dx%d @%dfps hw=%s", self.name, self.w, self.h, self.fps, self._nv12)
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name=f"ffmpeg-stderr-{self.name}", daemon=True
+        )
+        self._stderr_thread.start()
+        self.runtime_status.increment(
+            "decoder_starts", state="connecting", reason="ffmpeg_started",
+            decoder_pid=self._proc.pid, last_ffmpeg_exit_code=None,
+            retry_reason=None, retry_backoff_seconds=0.0, sanitized_stderr=None,
+        )
+        log_event(
+            logger, logging.INFO, "decoder_started", "FFmpeg decoder started",
+            decoder_pid=self._proc.pid, width=self.w, height=self.h,
+            target_fps=self.fps, hardware_decode=self._nv12,
+        )
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = proc.stderr.readline()
+                if not line:
+                    return
+                cleaned = sanitize_text(line.decode("utf-8", errors="replace"), limit=1024).strip()
+                if cleaned:
+                    self._stderr_lines.append(cleaned)
+        except (OSError, ValueError):
+            return
+
+    def _stderr_tail(self) -> str | None:
+        value = " | ".join(self._stderr_lines)
+        return sanitize_text(value, limit=4096) if value else None
 
     def _read_one(self):
         assert self._proc and self._proc.stdout
@@ -174,13 +240,28 @@ class FfmpegDecoder:
                 self._spawn()
             frame = self._read_one()
             if frame is None:
-                self.stop()
+                exit_code, stderr = self._finish_process()
                 if not self.is_stream:
                     # file pipe ended unexpectedly (stream_loop should prevent this) — respawn
+                    self.runtime_status.increment(
+                        "decoder_errors", state="unavailable", reason="file_decoder_ended",
+                        last_ffmpeg_exit_code=exit_code, sanitized_stderr=stderr,
+                    )
                     continue
                 self._status("unavailable", "stream_disconnected")
                 unavailable = True
-                logger.warning("decode[%s] stream ended; reconnecting in %.0fs", self.name, backoff)
+                self.runtime_status.increment(
+                    "decoder_errors", state="unavailable", reason="stream_disconnected",
+                    last_ffmpeg_exit_code=exit_code, retry_reason="stream_disconnected",
+                    retry_backoff_seconds=backoff, sanitized_stderr=stderr,
+                )
+                self.runtime_status.increment("reconnects")
+                log_event(
+                    logger, logging.WARNING, "decoder_reconnect_scheduled",
+                    "FFmpeg decoder ended; reconnect scheduled",
+                    ffmpeg_exit_code=exit_code, sanitized_stderr=stderr,
+                    retry_reason="stream_disconnected", retry_backoff_seconds=backoff,
+                )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 10.0)
                 continue
@@ -188,16 +269,50 @@ class FfmpegDecoder:
             if unavailable:
                 self._status("healthy", "none")
                 unavailable = False
+            self.runtime_status.frame()
             yield frame
 
     def _status(self, state: str, reason: str) -> None:
         if self.status_callback is not None:
-            self.status_callback(state, reason)
+            updated_session = self.status_callback(state, reason)
+            if updated_session and str(updated_session) != self.stream_session_id:
+                previous_session = self.stream_session_id
+                self.stream_session_id = str(updated_session)
+                set_stream_session_id(self.stream_session_id)
+                self.runtime_status.set_session(self.stream_session_id)
+                log_event(
+                    logger, logging.INFO, "decoder_recovered",
+                    "decoder recovered with a new stream session",
+                    previous_stream_session_id=previous_session,
+                )
 
     def stop(self) -> None:
-        if self._proc is not None:
+        self._finish_process()
+
+    def _finish_process(self) -> tuple[int | None, str | None]:
+        proc = self._proc
+        if proc is None:
+            return None, self._stderr_tail()
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+            exit_code = proc.returncode
+        except (OSError, ProcessLookupError):
+            exit_code = proc.poll()
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1.0)
+        stderr = self._stderr_tail()
+        for stream in (proc.stdout, proc.stderr):
             try:
-                self._proc.kill()
-            except Exception:  # noqa: BLE001
+                if stream is not None:
+                    stream.close()
+            except OSError:
                 pass
-            self._proc = None
+        self._proc = None
+        self._stderr_thread = None
+        return exit_code, stderr

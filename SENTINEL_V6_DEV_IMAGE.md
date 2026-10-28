@@ -1,12 +1,12 @@
 # Sentinel V6.0 Development Image
 
-Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20`
+Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22`
 
-Image ID: `5e9f55d489315737b089bea681788b78a1898d9244c67979d3d81bde60b0e2b6`
+Image ID: `ef8488352e2a4497c2f9249bd98e1a0f9dc53d45ee7152efd354ff90b13aec55`
 
-Local digest: `sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854`
+Local digest: `sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b`
 
-Registry digest: `sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854`
+Registry digest: `sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b`
 
 Publication status: pushed to the personal `kiranmaibattu-cyber` GHCR namespace.
 
@@ -22,7 +22,29 @@ deferred by the contract.
 
 ## Verified
 
+- Dev22 accepts and compiles 1, 8, 16, and 50-camera desired states and rejects
+  51. This validates the configuration and supervisor boundary, not guaranteed
+  simultaneous full-analytics throughput.
+- Dev22 emits structured JSON logs with UTC time, PID, camera ID and stream
+  session. A controlled FFmpeg termination recorded exit code 255, one-second
+  retry backoff, reconnect count/error count, automatic restart, and recovery
+  under a new stream session without restarting the pod.
+- Dev22 `/healthz` remained ready through the camera outage and exposed decoder
+  freshness, reconnect/error counters and delivery backlog metrics. The latest
+  camera-health state now has its own atomic runtime cache and no longer
+  disappears when an acknowledged outbox record is removed.
+- Dev22 full-app RTSPS validation loaded VAAPI decode, GPU detection/scene/fire,
+  and NPU face/body/gait paths. A stable sample decoded at 5.255 FPS against a
+  5 FPS target. The final image run persisted 32 V6 observations, 17 evidence
+  files and 14 embeddings before shutdown; the test deliberately had no
+  Management uploader configured.
+- The one-camera full-app test used about 1.9-2.0 GB container working set;
+  cgroup `memory.current`, which includes cache, was about 3.2-3.4 GB. The
+  existing 14 GiB limit is not a validated capacity for 50 full-app cameras.
 - V6 package validator passes: 5 schemas and 16 representative Event examples.
+- V6 runtime suite passes: 58 tests, including 1/8/16/50 configuration checks,
+  per-camera outage isolation, structured-log redaction, health/metrics and a
+  real local HTTP Event -> Evidence -> Embedding acknowledgement exchange.
 - Dev20 removes the unused dynamic-model runtime JSON from the repository and
   image. The runtime model consists of the XML/BIN pair; their hashes and the
   detector class mapping are unchanged from the tested dev19 build.
@@ -31,7 +53,7 @@ deferred by the contract.
   compilation and does not request `f32` inference precision. In-image
   OpenVINO 2026.2 testing detected the Camera12 car as class 1 (`car`) on GPU.
   Separate fixed-batch-2 testing also preserved both sample detections in FP16.
-- Dev19 runtime tests pass: 50 tests, including the nine-class model mapping,
+- Dev19 runtime tests passed 50 tests, including the nine-class model mapping,
   rejection of 5.2 desired state, and V6 acknowledgement validation.
 - A dev19 RTSPS run sustained approximately 4.87-5 FPS with VAAPI decode and
   delivered 200 observations, 97 JPEG evidence assets, and 93 embeddings to a
@@ -55,10 +77,10 @@ deferred by the contract.
 
 ## Not Yet Release-Ready
 
-- After acknowledged camera-health observations are removed from the outbox,
-  `/healthz` can fall back to `degraded/worker_starting` even while fresh frames
-  continue at the requested FPS. The latest acknowledged camera state needs a
-  separate durable runtime cache.
+- Configuration/supervision is validated at 1, 8, 16 and 50 cameras, but live
+  Intel throughput and memory are currently measured only for the one-camera
+  full-app profile and older smaller multi-camera profiles. Do not infer that
+  50 full-app 1080p cameras fit the current 14 GiB resource limit.
 - The dev19 RTSPS view produced repeated person track-loss/recovery transitions.
   This requires comparison with visual ground truth before changing association
   or lifecycle gates. The view did not contain qualifying ANPR, line-crossing,

@@ -56,6 +56,7 @@ COPY models/scene/openvino /models/scene/openvino
 COPY models/surveillance/transreid_ssl_int8.xml models/surveillance/transreid_ssl_int8.bin /models/surveillance/
 COPY models/surveillance/gaitbase_int8.xml models/surveillance/gaitbase_int8.bin /models/surveillance/
 COPY edge_runtime/solution_packs/sporada_secure/runtime_v6/image_schema /opt/traffic-pilot/image_schema
+COPY newdetails/sentry-v6/observation-examples.json /opt/traffic-pilot/image_schema/observation-examples.json
 COPY native/lib /opt/finalcombo
 COPY native/ocvlib /opt/finalcombo/ocvlib
 
@@ -77,6 +78,8 @@ RUN apt-get update \
         services/worker/pipeline/camera_state.py \
         services/worker/pipeline/resource_metrics.py \
         services/worker/pipeline/runtime_telemetry.py \
+        services/worker/pipeline/runtime_status.py \
+        services/worker/pipeline/structured_logging.py \
         services/worker/pipeline/scene_embeddings.py \
         services/worker/pipeline/person_reid.py \
         services/worker/pipeline/sentinel_delivery.py \
@@ -96,11 +99,14 @@ RUN apt-get update \
     && test -f /opt/finalcombo/libgpu_motion_gate_fixed_slots.so \
     && test -f /opt/finalcombo/libva_y_copy_bridge.so \
     && test -f /opt/finalcombo/ocvlib/libopencv_core.so.406 \
+    && test -f /opt/traffic-pilot/image_schema/desired-state.example.json \
+    && test -f /opt/traffic-pilot/image_schema/observation-examples.json \
+    && test -f /opt/traffic-pilot/image_schema/acknowledgement.example.json \
     && mkdir -p /tmp/sentinel/cache \
     && chown -R apexruntime:apexruntime /tmp/sentinel \
     && test "$(id -u apexruntime)" = "10001"
 
-ARG IMAGE_VERSION=2026.10.27-v6-dev20
+ARG IMAGE_VERSION=2026.10.28-v6-dev22
 ARG INTEL_TRAFFIC_RUNTIME_BASE_DIGEST=unresolved
 
 LABEL org.opencontainers.image.source="https://github.com/kiranmaibattu-cyber/sentry_cv" \
@@ -110,6 +116,8 @@ LABEL org.opencontainers.image.source="https://github.com/kiranmaibattu-cyber/se
       io.apexfabric.contract.version="6.0" \
       io.apexfabric.wire.schema.version="6.0" \
       io.apexfabric.contract.status="development" \
+      io.apexfabric.max-configured-cameras="50" \
+      io.apexfabric.logs.format="json" \
       io.apexfabric.hardware.profile="intel-285h" \
       io.apexfabric.image.role="solution-runtime" \
       io.apexfabric.solution-pack="sentinel-cv-runtime" \

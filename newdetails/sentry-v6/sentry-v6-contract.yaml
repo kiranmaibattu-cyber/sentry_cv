@@ -131,9 +131,9 @@ runtimeEndpoints:
     route: GET /readyz
     readyWhen:
       - desired_state_is_valid
-      - shared_models_are_loaded
-      - inference_scheduler_is_running
-      - per_camera_supervisors_and_recovery_loops_are_running
+      - solution_http_event_loop_is_running
+      - camera_worker_supervisor_is_running
+      - per_camera_process_supervision_and_recovery_loops_are_running
     mustNotRequire: every_configured_camera_is_healthy
     responseIncludes:
       - ready
@@ -143,7 +143,7 @@ runtimeEndpoints:
   recheck: deferred
 runtimeAvailability:
   cameraIsolation: one_failed_camera_must_not_stop_decode_inference_or_delivery_for_healthy_cameras
-  startup: shared_models_and_worker_start_independently_of_camera_connectivity
+  startup: solution_and_camera_worker_supervisor_start_independently_of_camera_connectivity
   retry: failed_cameras_retry_independently_with_bounded_backoff_and_rejoin_without_process_restart
   cameraHealth: emit_transition_and_freshness_heartbeat_per_camera
   recovery: recovered_camera_rejoins_without_pod_restart_and_starts_a_new_stream_session
@@ -151,14 +151,28 @@ runtimeAvailability:
     - failed_camera_tracks_become_unknown_not_departed
     - failed_camera_counts_become_unknown_not_zero
     - healthy_cameras_continue_events_evidence_embeddings_and_delivery
+runtimeObservability:
+  logs:
+    format: structured_json
+    requiredFields: [timestamp, level, pid, camera_id, stream_session_id, event, message]
+    decoderEvents: [startup, exit, reconnect_scheduled, retry]
+    decoderDiagnostics: [ffmpeg_exit_code, sanitized_stderr, retry_reason, retry_backoff_seconds]
+    secrets: never_log_camera_url_credentials_tokens_or_bearer_values
+  health:
+    remainsAvailableDuringCameraOutages: true
+    perCamera: [state, reason, last_frame_at, last_frame_age_seconds, reconnects, decoder_errors, last_ffmpeg_exit_code, retrying]
+  deliveryMetrics:
+    artifactKinds: [observation, evidence, embedding]
+    fields: [pending_count, pending_bytes, oldest_pending_age_seconds, upload_attempts_total, acknowledgements_total, retries_total, http_rejections]
 managementCompatibility:
   cameraHealthStates: [healthy, degraded, unavailable]
   staleHeartbeat: surface_as_unavailable_with_reason_heartbeat_silence
   dashboard: show_per_camera_state_reason_and_last_reliable_at
   deploymentStatus: remain_ready_when_runtime_is_operational_even_if_one_or_more_cameras_are_unavailable
 resources:
-  recommendedMaxCameraStreams: 4
-  hardCapCameraStreams: 8
+  configuredCameraLimit: 50
+  hardCapCameraStreams: 50
+  performanceQualification: workload_fps_resolution_and_enabled_models_must_be_reported_separately
   cpu: {request: "6", limit: "12"}
   memory: {request: 8Gi, limit: 14Gi}
   processUid: 10001

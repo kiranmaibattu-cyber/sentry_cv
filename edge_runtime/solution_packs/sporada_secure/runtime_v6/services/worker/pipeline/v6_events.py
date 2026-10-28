@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from contextlib import nullcontext
 import hashlib
+import logging
 import math
 import os
 from pathlib import Path
@@ -18,6 +19,11 @@ import numpy as np
 
 from .face_samples import FaceSamplePipeline
 from .sentinel_delivery import SentinelV6Outbox, SentinelV6Uploader
+from .structured_logging import set_stream_session_id
+from .runtime_status import write_camera_health_status
+
+
+logger = logging.getLogger(__name__)
 
 
 def utc(value: float) -> str:
@@ -59,14 +65,15 @@ def bbox_normalized(box, width, height):
 
 class V6EventPipeline:
     def __init__(self, camera_id: str, config: dict[str, Any], *, scene=None, body=None,
-                 gait=None, telemetry=None):
+                 gait=None, telemetry=None, stream_session_id: str | None = None):
         self.camera_id = camera_id
         self.config = (config.get("analytics") or {}).get("v6_events", {}).get("v6") or {}
         self.bindings = list(self.config["bindings"])
         geometry = self.config.get("geometry") or {}
         self.zones = {item["id"]: item for item in geometry.get("zones") or []}
         self.lines = {item["id"]: item for item in geometry.get("counting_lines") or []}
-        self.session_id = str(uuid.uuid4())
+        self.session_id = str(stream_session_id or uuid.uuid4())
+        set_stream_session_id(self.session_id)
         self.scene, self.body, self.gait = scene, body, gait
         self.telemetry = telemetry
         self.tracks: dict[tuple[str, str], dict[str, Any]] = {}
@@ -151,10 +158,10 @@ class V6EventPipeline:
         self.counts = {key: value for key, value in self.counts.items() if key[0] in enabled_ids}
         self.last_scene = {key: value for key, value in self.last_scene.items() if key[0] in enabled_ids}
 
-    def camera_status(self, status: str, reason: str) -> None:
+    def camera_status(self, status: str, reason: str) -> str:
         now = time.time()
         if status == self.health_state:
-            return
+            return self.session_id
         if status == "unavailable":
             for candidate in self.face_candidates.values():
                 candidate["deadline"] = now
@@ -175,7 +182,7 @@ class V6EventPipeline:
                                       state="unavailable", reason=reason, as_of=utc(now),
                                       last_reliable_at=utc(self.last_reliable_at) if self.last_reliable_at is not None else None,
                                       sampling_gap_seconds=max(0.0, now - self.last_reliable_at) if self.last_reliable_at is not None else 0.0))
-            return
+            return self.session_id
         if status == "healthy" and self.health_state == "unavailable":
             for candidate in self.face_candidates.values():
                 candidate["deadline"] = now
@@ -194,11 +201,13 @@ class V6EventPipeline:
             self.counts.clear()
             self.last_scene.clear()
             self.session_id = str(uuid.uuid4())
+            set_stream_session_id(self.session_id)
             self.health_state = "healthy"
             self.last_health = now
             self._persist(self._event("camera_health", now, None,
                                       state="healthy", reason="none", as_of=utc(now),
                                       last_reliable_at=utc(now), sampling_gap_seconds=0))
+        return self.session_id
 
     def _event(self, event_type, now, frame_id, use_case_id=None, **fields):
         return {"schema_version": "6.0", "observation_id": str(uuid.uuid4()),
@@ -211,6 +220,11 @@ class V6EventPipeline:
     def _persist(self, event, evidence=(), embeddings=()):
         started = perf_counter()
         self.store.persist(event, list(evidence), list(embeddings))
+        if event.get("event_type") == "camera_health":
+            try:
+                write_camera_health_status(self.camera_id, event)
+            except OSError:
+                logger.exception("could not update latest camera health status")
         if self.telemetry is not None:
             self.telemetry.event_persisted(event, perf_counter() - started)
 

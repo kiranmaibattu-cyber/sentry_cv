@@ -25,10 +25,20 @@ from pathlib import Path
 import sys
 import time
 from typing import Any
+import uuid
 
 from pipeline.motion_gate import MotionGateController
+from pipeline.runtime_status import (
+    increment_supervisor_status,
+    read_decoder_status,
+)
+from pipeline.structured_logging import (
+    configure_structured_logging,
+    log_event,
+    set_log_context,
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+configure_structured_logging()
 log = logging.getLogger("stream_fleet_openvino")
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -238,6 +248,8 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
     """Child process: owns ONE camera end to end. Builds its own Core, detectors,
     OCR, tracker/analytics stages, decoder and analytics publisher - no shared state."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    stream_session_id = str(uuid.uuid4())
+    set_log_context(cam.get("name"), stream_session_id)
     os.environ.setdefault("OPENVINO_MODELS_DIR", OPENVINO_MODELS_DIR)
     # Die if the parent worker dies (even on SIGKILL), so camera processes — and the
     # ffmpeg decoders they own — never orphan and keep hogging the GPU/media engine.
@@ -271,6 +283,9 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
     from pipeline.types import FramePacket
 
     name, uri = cam["name"], cam["uri"]
+    camera_fps = max(1, int(round(float(
+        (camera_config.get("processing") or {}).get("fps", INFER_FPS)
+    ))))
     camera_configs = {name: camera_config}
     worker_config = load_worker_config()
     mc = model_config_from_worker_config(worker_config)
@@ -407,7 +422,7 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
     if scene_extractor is not None:
         telemetry_devices["scene_embedding"] = SCENE_EMBEDDER_DEVICE
     telemetry = CameraTelemetry(
-        name, target_fps=INFER_FPS, devices=telemetry_devices,
+        name, target_fps=camera_fps, devices=telemetry_devices,
         use_case_catalog={str(item["use_case_id"]): str(item["app"])
                           for item in v6.get("bindings") or []},
     )
@@ -419,7 +434,8 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
         from pipeline.v6_events import V6EventPipeline
         v6_pipeline = V6EventPipeline(name, camera_config, scene=scene_extractor,
                                       body=body_extractor, gait=gait_extractor,
-                                      telemetry=telemetry)
+                                      telemetry=telemetry,
+                                      stream_session_id=stream_session_id)
 
     crossing_pipeline = None
     if "vehicle_entry_exit_counts" in runtime and not enable_v6:
@@ -457,7 +473,17 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
                                 stream_key=stream_key)
     analytics = AsyncAnalyticsDispatcher(sink=sink, camera_configs=camera_configs,
                                          max_queue_size=4000).start()
-    log.info("cam[%s] up: vehicle=%s plate=%s smoke_fire=%s ocr=%s face=%s body=%s gait=%s scene=%s v6=%s", name, veh.exec_devices,
+    log_event(log, logging.INFO, "camera_pipeline_started", "camera pipeline started",
+              target_fps=camera_fps, vehicle_device=str(veh.exec_devices),
+              plate_device=str(plate.exec_devices) if plate is not None else "disabled",
+              fire_smoke_device=str(smoke_fire.exec_devices) if smoke_fire is not None else "disabled",
+              ocr_device=str(async_ocr.actual_device) if async_ocr is not None else "disabled",
+              face_device="GPU+NPU" if face_pipeline is not None else "disabled",
+              body_device=BODY_REID_DEVICE if body_extractor is not None else "disabled",
+              gait_device=GAIT_DEVICE if gait_extractor is not None else "disabled",
+              scene_device=SCENE_EMBEDDER_DEVICE if scene_extractor is not None else "disabled",
+              v6_events_enabled=v6_pipeline is not None)
+    log.debug("cam[%s] device summary: vehicle=%s plate=%s smoke_fire=%s ocr=%s face=%s body=%s gait=%s scene=%s v6=%s", name, veh.exec_devices,
              plate.exec_devices if plate is not None else "disabled",
              smoke_fire.exec_devices if smoke_fire is not None else "disabled",
              async_ocr.actual_device if async_ocr is not None else "disabled",
@@ -476,8 +502,11 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
         path = Path(ready_dir)
         path.mkdir(parents=True, exist_ok=True)
         ready_path = path / f"{name}.ready"
-    dec = FfmpegDecoder(uri, fps=INFER_FPS, name=name,
-                        status_callback=v6_pipeline.camera_status if v6_pipeline is not None else None)
+    dec = FfmpegDecoder(
+        uri, fps=camera_fps, name=name,
+        status_callback=v6_pipeline.camera_status if v6_pipeline is not None else None,
+        stream_session_id=stream_session_id,
+    )
     fidx = 0
     last = time.time()
     report_n = 0
@@ -505,7 +534,9 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
         if motion_gate is None:
             gate_state, gate_ran, gate_reason = "off", True, "disabled"
         else:
-            gate_state, gate_ran, gate_reason = motion_gate.update(frame, frame_received_at, INFER_FPS)
+            gate_state, gate_ran, gate_reason = motion_gate.update(
+                frame, frame_received_at, camera_fps
+            )
         telemetry.frame(inferred=gate_ran)
 
         if not gate_ran:
@@ -618,13 +649,25 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
         telemetry.maybe_flush()
         report_n += 1
         if tnow - last >= 10.0:
-            log.info("cam[%s] %.1f fps", name, report_n / (tnow - last))
-            if motion_gate is not None:
-                log.info("cam[%s] motion_gate state=%s switches=%d sweeps=%d skipped=%d inferred=%d motion_frames=%d",
-                         name, "TRACKING" if motion_gate.tracking else "MOTION",
-                         motion_gate.switches, motion_gate.sweeps,
-                         motion_gate.skipped_frames, motion_gate.inferred_frames,
-                         motion_gate.motion_frames)
+            summary = telemetry.latest_snapshot or telemetry.flush(force=True) or {}
+            processing = summary.get("processing") or {}
+            log_event(
+                log, logging.INFO, "camera_telemetry_summary",
+                "current per-camera telemetry summary",
+                target_fps=processing.get("target_fps"),
+                decoded_fps=processing.get("decoded_fps"),
+                inference_fps=processing.get("inference_fps"),
+                output_events_per_second=processing.get("output_events_per_second"),
+                motion_gate_state=(
+                    "disabled" if motion_gate is None
+                    else "TRACKING" if motion_gate.tracking else "MOTION"
+                ),
+                motion_switches=motion_gate.switches if motion_gate is not None else None,
+                motion_sweeps=motion_gate.sweeps if motion_gate is not None else None,
+                motion_skipped_frames=(
+                    motion_gate.skipped_frames if motion_gate is not None else None
+                ),
+            )
             last = tnow
             report_n = 0
     telemetry.close()
@@ -655,14 +698,23 @@ def main() -> int:
         process = ctx.Process(target=_camera_proc, name=f"cam-{camera['name']}", daemon=False,
                               args=(camera, build_camera_config(camera), rhost, rport, skey))
         process.start()
+        increment_supervisor_status(
+            camera["name"], "process_starts", state="starting",
+            camera_process_pid=process.pid, retrying=False,
+        )
         return process
 
     procs = [start_camera(camera) for camera in cams]
     restart_delays = {camera["name"]: 5.0 for camera in cams}
     next_restart = {camera["name"]: 0.0 for camera in cams}
+    restart_scheduled = {camera["name"]: False for camera in cams}
     process_started = {camera["name"]: time.monotonic() for camera in cams}
-    log.info("started %d camera processes (shared-nothing, one ov.Core each) @ %dfps",
-             len(procs), INFER_FPS)
+    log_event(
+        log, logging.INFO, "camera_process_fleet_started",
+        "camera process fleet started",
+        camera_count=len(procs), architecture="shared-nothing",
+        openvino_core_per_camera=True,
+    )
 
     try:
         while True:
@@ -673,16 +725,38 @@ def main() -> int:
                     continue
                 camera = cams[index]
                 name = camera["name"]
+                decoder_status = read_decoder_status(name)
+                if not restart_scheduled[name]:
+                    log_event(
+                        log, logging.ERROR, "camera_process_exited",
+                        "camera process exited; restart scheduled",
+                        camera_id=name, camera_process_pid=process.pid,
+                        stream_session_id=decoder_status.get("stream_session_id"),
+                        exit_code=process.exitcode, retry_reason="camera_process_exited",
+                        retry_backoff_seconds=restart_delays[name],
+                    )
+                    increment_supervisor_status(
+                        name, "process_exits", state="process_exited",
+                        camera_process_pid=process.pid, exit_code=process.exitcode,
+                        retrying=True, retry_reason="camera_process_exited",
+                        retry_backoff_seconds=restart_delays[name],
+                    )
+                    process.join(timeout=0)
+                    next_restart[name] = now + restart_delays[name]
+                    restart_delays[name] = min(restart_delays[name] * 2, 60.0)
+                    restart_scheduled[name] = True
+                    continue
                 if now < next_restart[name]:
                     continue
-                log.error("camera process %s exited (code %s); restarting in %.0fs",
-                          process.name, process.exitcode, restart_delays[name])
-                process.join(timeout=0)
-                next_restart[name] = now + restart_delays[name]
-                restart_delays[name] = min(restart_delays[name] * 2, 60.0)
                 procs[index] = start_camera(camera)
                 process_started[name] = now
-                log.info("camera process %s restarted", name)
+                restart_scheduled[name] = False
+                log_event(
+                    log, logging.INFO, "camera_process_restarted",
+                    "camera process restarted", camera_id=name,
+                    stream_session_id=decoder_status.get("stream_session_id"),
+                    camera_process_pid=procs[index].pid,
+                )
             for index, camera in enumerate(cams):
                 name = camera["name"]
                 if procs[index].is_alive() and now - process_started[name] >= 30:

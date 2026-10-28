@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,8 @@ from pipeline.ocr_stabilizer import OcrStabilizer
 from pipeline.sentinel_delivery import SentinelV6Uploader
 from pipeline.face_samples import AdaptiveFaceScheduler, FaceSamplePipeline
 from pipeline.runtime_telemetry import CameraTelemetry
+from pipeline.runtime_status import DecoderRuntimeStatus
+from pipeline.structured_logging import JsonLogFormatter, set_log_context
 from pipeline.resource_metrics import AcceleratorSampler, CgroupSampler
 from detectors.backends.openvino_ocr_async import AsyncOCR
 from detectors.backends.openvino_smoke_fire import _device_with_fallback
@@ -36,7 +39,8 @@ from stream_fleet_openvino import (
     require_accelerator_device,
     should_evaluate_fire_smoke,
 )
-from traffic_pilot_runtime.desired_state import DesiredStateValidator
+from traffic_pilot_runtime.desired_state import MAX_CAMERAS, DesiredStateValidator
+from traffic_pilot_runtime.graph import compile_runtime_plan
 from traffic_pilot_runtime.solution_image_entrypoint import (
     RuntimeState, _health_payload, _hot_reload_signature, _metrics, _per_camera_state,
 )
@@ -159,6 +163,82 @@ def test_health_payload_and_prometheus_metrics_include_per_camera_telemetry(
     assert 'sentinel_events_emitted_total{camera_id="cam-a",event_type="zone_count"} 1' in prometheus
 
 
+def test_structured_logs_include_context_and_redact_credentials():
+    set_log_context("cam-a", "session-a")
+    record = logging.LogRecord(
+        "decoder", logging.ERROR, __file__, 1,
+        "failed %s", ("rtsp://user:password@example.test/live?token=secret",),
+        None,
+    )
+    payload = json.loads(JsonLogFormatter().format(record))
+    assert payload["camera_id"] == "cam-a"
+    assert payload["stream_session_id"] == "session-a"
+    assert payload["pid"] > 0
+    assert payload["timestamp"].endswith("Z")
+    assert payload["event"] == "log_message"
+    assert "password" not in payload["message"]
+    assert "secret" not in payload["message"]
+    assert "<redacted-url>" in payload["message"]
+
+
+def test_health_uses_decoder_status_during_camera_outage(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    status = DecoderRuntimeStatus("cam-a", "session-a")
+    status.increment(
+        "decoder_errors", state="unavailable", reason="stream_disconnected",
+        retry_reason="stream_disconnected", retry_backoff_seconds=4,
+        last_ffmpeg_exit_code=1, sanitized_stderr="connection refused",
+    )
+    status.increment("reconnects")
+    state = RuntimeState("/configs/desired_state.json")
+    with state.lock:
+        state.ready = True
+        state.worker_running = True
+        state.active_revision = 6
+        state.plan = {"edge_id": "edge-a", "cameras": [{"camera_id": "cam-a"}]}
+    payload = _health_payload(state)
+    camera = payload["telemetry"]["cameras"][0]
+    assert payload["ready"] is True
+    assert camera["camera_health"]["state"] == "unavailable"
+    assert camera["decoder"]["reconnects"] == 1
+    assert camera["decoder"]["decoder_errors"] == 1
+    assert camera["decoder"]["last_ffmpeg_exit_code"] == 1
+    assert camera["decoder"]["retry_backoff_seconds"] == 4
+
+
+def test_one_failed_camera_does_not_block_healthy_peer_or_readiness(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    healthy = DecoderRuntimeStatus("cam-healthy", "session-healthy")
+    healthy.frame()
+    failed = DecoderRuntimeStatus("cam-failed", "session-failed")
+    failed.increment(
+        "decoder_errors", state="unavailable", reason="stream_disconnected",
+        retry_reason="stream_disconnected", retry_backoff_seconds=2,
+    )
+    state = RuntimeState("/configs/desired_state.json")
+    with state.lock:
+        state.ready = True
+        state.worker_running = True
+        state.active_revision = 6
+        state.plan = {
+            "edge_id": "edge-a",
+            "cameras": [
+                {"camera_id": "cam-healthy"},
+                {"camera_id": "cam-failed"},
+            ],
+        }
+    payload = _health_payload(state)
+    cameras = {
+        item["camera_id"]: item for item in payload["telemetry"]["cameras"]
+    }
+    assert payload["ready"] is True
+    assert payload["worker_running"] is True
+    assert cameras["cam-healthy"]["camera_health"]["state"] == "healthy"
+    assert cameras["cam-failed"]["camera_health"]["state"] == "unavailable"
+
+
 def packet(index, boxes=(), plate=None):
     detections = [SimpleNamespace(model_name="vehicle", class_name=kind,
                                   bbox=box, confidence=.9,
@@ -174,6 +254,61 @@ def packet(index, boxes=(), plate=None):
 def binding(use_case_id, app, scope="full_frame", ids=(), kind="vehicle", **extra):
     return {"use_case_id": use_case_id, "app": app, "scope": scope,
             "geometry_ids": list(ids), "object_types": [] if kind is None else [kind], **extra}
+
+
+def desired_state_with_cameras(secret_root: Path, count: int) -> dict:
+    cameras = []
+    for index in range(count):
+        camera_id = f"cam-{index:02d}"
+        secret = secret_root / f"{camera_id}.url"
+        secret.write_text(f"rtsp://127.0.0.1/{camera_id}", encoding="utf-8")
+        cameras.append({
+            "camera_id": camera_id,
+            "source": f"file:{secret}",
+            "fps": 5,
+            "bindings": [binding(f"count-{index:02d}", "vehicle_counting")],
+        })
+    return {
+        "contract": "sentry-v6", "schema_version": "6.0",
+        "edge_id": "edge", "deployment_id": "scale-test", "revision": 1,
+        "cameras": cameras,
+    }
+
+
+@pytest.mark.parametrize("camera_count", [1, 8, 16, 50])
+def test_desired_state_accepts_supported_camera_counts(
+    tmp_path, camera_count,
+):
+    secret_root = tmp_path / "cameras"
+    secret_root.mkdir()
+    validator = DesiredStateValidator(secret_root)
+    desired = desired_state_with_cameras(secret_root, camera_count)
+    validator.schema["$defs"]["camera"]["properties"]["source"]["pattern"] = (
+        r"^file:.*cam-[0-9]+\.url$"
+    )
+    validator.validate(desired)
+    loaded = validator.load(_write_desired_state(tmp_path, desired))
+    plan = compile_runtime_plan(loaded)
+    assert len(plan.cameras) == camera_count
+
+
+def test_desired_state_rejects_more_than_fifty_cameras(tmp_path):
+    assert MAX_CAMERAS == 50
+    secret_root = tmp_path / "cameras"
+    secret_root.mkdir()
+    validator = DesiredStateValidator(secret_root)
+    desired = desired_state_with_cameras(secret_root, 51)
+    validator.schema["$defs"]["camera"]["properties"]["source"]["pattern"] = (
+        r"^file:.*cam-[0-9]+\.url$"
+    )
+    with pytest.raises(ValueError):
+        validator.validate(desired)
+
+
+def _write_desired_state(tmp_path: Path, payload: dict) -> Path:
+    path = tmp_path / "desired-state.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def config(bindings, zones=(), lines=()):
@@ -1040,6 +1175,11 @@ def test_real_http_event_evidence_embedding_exchange(tmp_path, monkeypatch):
     pipeline.process(packet(1))
     record_path = next(item for item in pipeline.store.outbox.glob("*.json")
                        if json.loads(item.read_text())["observation"]["event_type"] == "scene_sample")
+    pipeline.store.metrics.pending(pipeline.store.outbox, force=True)
+    pending = json.loads(pipeline.store.metrics.path.read_text())
+    assert pending["artifacts"]["observation"]["pending_count"] >= 1
+    assert pending["artifacts"]["evidence"]["pending_count"] >= 1
+    assert pending["artifacts"]["embedding"]["pending_count"] >= 1
     received = []
 
     class Receiver(BaseHTTPRequestHandler):
@@ -1088,6 +1228,14 @@ def test_real_http_event_evidence_embedding_exchange(tmp_path, monkeypatch):
     assert received == ["/api/v6/ingest/events", "/api/v6/ingest/evidence",
                         "/api/v6/ingest/embeddings"]
     assert not record_path.exists()
+    delivered = json.loads(pipeline.store.metrics.path.read_text())
+    for kind in ("observation", "evidence", "embedding"):
+        expected_decrease = 1
+        assert delivered["artifacts"][kind]["pending_count"] == (
+            pending["artifacts"][kind]["pending_count"] - expected_decrease
+        )
+        assert delivered["artifacts"][kind]["upload_attempts_total"] >= 1
+        assert delivered["artifacts"][kind]["acknowledgements_total"] >= 1
 
 
 def test_desired_state_rejects_stale_fields(tmp_path):

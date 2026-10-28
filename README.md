@@ -11,11 +11,11 @@ container startup.
 ## Current V6 Image Candidate
 
 ```text
-ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20
-image ID: 5e9f55d489315737b089bea681788b78a1898d9244c67979d3d81bde60b0e2b6
-local digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
+ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22
+image ID: ef8488352e2a4497c2f9249bd98e1a0f9dc53d45ee7152efd354ff90b13aec55
+local digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
 publication status: published development image in personal GHCR
-registry digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
+registry digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
 ```
 
 This is the first candidate in this repository with a true V6 wire boundary.
@@ -29,6 +29,13 @@ The image is built from:
 - `edge_runtime/solution_packs/sporada_secure/runtime_v6`
 - `newdetails/sentry-v6`
 - baked OpenVINO/ONNX model files under `models/`
+
+Dev22 raises the V6 desired-state/configuration limit to 50 cameras, adds
+credential-safe structured decoder/process logs, fault-aware per-camera health,
+and durable delivery/outbox telemetry for observations, evidence, and
+embeddings. It preserves schema 6.0 and `/api/v6/ingest/*`. The 50-camera value
+is a configuration/supervision limit; throughput and memory still require a
+declared resolution, FPS, and enabled-app workload.
 
 Dev20 uses the dynamic-batch nine-class vehicle IR introduced in dev19 and
 removes the unused `vehicle_yolo26n_fp16_dynamic.runtime.json` manifest. The
@@ -109,14 +116,14 @@ Build the GHCR image:
 
 ```bash
 SENTINEL_IMAGE_REPOSITORY=ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime \
-SENTINEL_IMAGE_VERSION=2026.10.27-v6-dev20 \
+SENTINEL_IMAGE_VERSION=2026.10.28-v6-dev22 \
 ./scripts/build_sentinel_v6_image.sh
 ```
 
 Push it:
 
 ```bash
-podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20
+podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22
 ```
 
 ## Contract And Design Docs

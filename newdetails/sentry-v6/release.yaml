@@ -2,10 +2,10 @@ contract: sentry-v6
 schema_version: "6.0"
 wire_schema_version: "6.0"
 status: published-development
-image: ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.27-v6-dev20
-registry_digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
-local_digest: sha256:37d1bacb9d1537c92c737c0ff1e903810057f8aa17cb00dac7ccc05e8f30b854
-image_id: 5e9f55d489315737b089bea681788b78a1898d9244c67979d3d81bde60b0e2b6
+image: ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22
+registry_digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
+local_digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
+image_id: ef8488352e2a4497c2f9249bd98e1a0f9dc53d45ee7152efd354ff90b13aec55
 architecture: amd64
 hardware_profile: intel-285h
 changes:
@@ -22,20 +22,34 @@ changes:
   - dynamic_batch_vehicle_ir_with_fixed_batch_one_gpu_compilation
   - nine_class_vehicle_model_mapping_at_detector_boundary
   - removed_unused_vehicle_runtime_manifest
+  - desired_state_and_runtime_limit_support_for_50_configured_cameras
+  - structured_credential_safe_decoder_and_process_logs
+  - per_camera_decoder_freshness_reconnect_error_and_backoff_health
+  - observation_evidence_and_embedding_outbox_delivery_metrics
+  - latest_camera_health_cache_independent_of_acknowledged_outbox_records
+  - corrected_console_summary_from_current_per_camera_telemetry
 validation:
-  runtime_tests: 50
+  runtime_tests: 58
   schemas: 5
   event_examples: 16
+  accepted_camera_configuration_counts: [1, 8, 16, 50]
+  rejected_camera_configuration_counts: [51]
   live_rtsps:
     target_fps: 5
-    sustained_fps_range: [4.87, 5.0]
-    observations_delivered: 200
-    evidence_delivered: 97
-    embeddings_delivered: 93
-    remaining_outbox: 0
-    dead_letters: 0
+    stable_decoded_fps: 5.255
+    observations_persisted_final_image: 32
+    evidence_persisted_final_image: 17
+    embeddings_persisted_final_image: 14
+    forced_decoder_reconnects: 1
+    decoder_errors_recorded: 1
+    recovered_without_pod_restart: true
+  one_camera_full_app_memory:
+    podman_working_set_gib: [1.9, 2.0]
+    cgroup_memory_current_gib: [3.2, 3.4]
+  delivery_http_exchange_test: observation_then_evidence_then_embedding_acknowledged
 known_issues:
-  - acknowledged_camera_health_is_not_retained_for_healthz_state_resolution
+  - 50_camera_configuration_limit_is_not_a_50_camera_full_app_throughput_claim
+  - higher_camera_count_memory_and_fps_require_workload_specific_intel_qualification
   - tested_view_showed_repeated_person_loss_recovery_transitions
 untested_live_triggers:
   - anpr

@@ -35,6 +35,8 @@ desired = read_json("desired-state.example.json")
 checks["desired-state.schema.json"].validate(desired)
 evidence = read_json("evidence.example.json")
 checks["evidence.schema.json"].validate(evidence)
+acknowledgement = read_json("acknowledgement.example.json")
+checks["acknowledgement.schema.json"].validate(acknowledgement)
 events = read_json("observation-examples.json")
 for event in events:
     checks["observation.schema.json"].validate(event)
@@ -54,6 +56,36 @@ expected_apps = {
     "person_identity", "fire_smoke", "scene_search",
 }
 assert expected_apps == set(schemas["desired-state.schema.json"]["$defs"]["app"]["enum"])
+assert schemas["desired-state.schema.json"]["properties"]["cameras"]["maxItems"] == 50
+
+for camera_count in (1, 8, 16, 50):
+    scaled = copy.deepcopy(desired)
+    scaled["cameras"] = []
+    for index in range(camera_count):
+        camera_id = f"scale-camera-{index:02d}"
+        scaled["cameras"].append({
+            "camera_id": camera_id,
+            "source": f"file:/run/secrets/sentinel/cameras/{camera_id}.url",
+            "fps": 5,
+            "bindings": [{
+                "use_case_id": f"scale-count-{index:02d}",
+                "app": "vehicle_counting", "scope": "full_frame",
+                "geometry_ids": [], "object_types": ["vehicle"],
+            }],
+        })
+    checks["desired-state.schema.json"].validate(scaled)
+
+too_many = copy.deepcopy(scaled)
+too_many["cameras"].append({
+    "camera_id": "scale-camera-50",
+    "source": "file:/run/secrets/sentinel/cameras/scale-camera-50.url",
+    "fps": 5,
+    "bindings": [{
+        "use_case_id": "scale-count-50", "app": "vehicle_counting",
+        "scope": "full_frame", "geometry_ids": [], "object_types": ["vehicle"],
+    }],
+})
+rejected(checks["desired-state.schema.json"], too_many)
 
 camera = desired["cameras"][0]
 geometry = {
@@ -194,4 +226,4 @@ subject_semantic.update(presence_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
 checks["embedding.schema.json"].validate(subject_semantic)
 
 print(f"PASS: {len(schemas)} schemas, {len(events)} event examples, V6 app catalog, "
-      "cross-references, and stale-field checks")
+      "1/8/16/50-camera limits, cross-references, and stale-field checks")

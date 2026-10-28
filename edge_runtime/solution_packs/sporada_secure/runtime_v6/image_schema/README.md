@@ -8,28 +8,27 @@ V6 is not wire-compatible with 5.2. Any persisted 5.2 outbox must be drained
 with the previous runtime before upgrading; partially acknowledged records
 must never be silently relabelled as V6.
 
-This directory is self-contained for CV-team implementation and validation. It
-includes:
+This directory is embedded in the runtime image at
+`/opt/traffic-pilot/image_schema`. It includes:
 
 - `sentry-v6-contract.yaml`: complete edge/management boundary and runtime behavior.
 - `desired-state.schema.json` and `desired-state.example.json`.
 - `observation.schema.json` and `observation-examples.json`.
 - `evidence.schema.json` and `evidence.example.json`.
-- `embedding.schema.json` and `acknowledgement.schema.json`.
-- `validate_contract.py`: schema and representative boundary validation.
-- `release.yaml`: runtime-image publication status.
+- `embedding.schema.json`, `acknowledgement.schema.json`, and
+  `acknowledgement.example.json`.
 
-Run the contract checks from this directory with:
-
-```bash
-python3 validate_contract.py
-```
+The source repository's `newdetails/sentry-v6` directory contains the package
+validator and immutable-image release metadata.
 
 The runtime also defines camera fault isolation. A configured camera that
 cannot decode becomes `unavailable`, retries in its own supervisor, and leaves
-healthy cameras processing. `/readyz` reports the runtime ready when shared
-models, the inference scheduler, and recovery loops are operational; it does
-not require every camera to be healthy.
+healthy cameras processing. `/readyz` reports the runtime ready when the
+HTTP/runtime supervisor and per-camera recovery loops are operational; it
+does not require every camera or every camera-local model process to be healthy.
+
+One desired-state revision may configure 1 through 50 cameras. Measured FPS
+and memory still depend on stream resolution and enabled analytics.
 
 The recent management changes are compatible consumers of this behavior:
 camera-health state uses the existing `healthy`, `degraded`, and `unavailable`

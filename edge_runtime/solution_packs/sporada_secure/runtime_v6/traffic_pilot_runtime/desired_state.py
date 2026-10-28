@@ -11,7 +11,7 @@ import jsonschema
 CONTRACT = "sentry-v6"
 SCHEMA_VERSION = "6.0"
 SOLUTION_PACK = "sentinel-cv-runtime"
-MAX_CAMERAS = 8
+MAX_CAMERAS = 50
 STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "image_schema" / "desired-state.schema.json"
 LINE_APPS = {"vehicle_entry_exit_counts", "people_entry_exit_counts", "line_crossing"}
@@ -67,6 +67,8 @@ class DesiredStateValidator:
         if errors:
             error = errors[0]
             raise ValueError(f"desired state {'.'.join(map(str, error.path))}: {error.message}")
+        if len(data["cameras"]) > MAX_CAMERAS:
+            raise ValueError(f"desired state supports at most {MAX_CAMERAS} cameras")
         camera_ids: set[str] = set()
         all_use_cases: set[str] = set()
         for camera in data["cameras"]:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import logging
 import mimetypes
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -19,6 +21,11 @@ from .adapter import write_worker_config
 from .desired_state import SOLUTION_PACK, DesiredState, DesiredStateValidator, file_hash
 from .graph import RuntimePlan, compile_runtime_plan
 from .retention import SnapshotRetention
+from .runtime_logging import configure_supervisor_logging
+
+
+configure_supervisor_logging()
+logger = logging.getLogger("sentinel_solution_supervisor")
 
 CONTRACT_EVENT_TYPES = frozenset({
     "plate_read",
@@ -152,6 +159,11 @@ class WorkerSupervisor:
             "APEXFABRIC_CAMERA_READY_DIR": str(ready_dir),
         })
         command = [sys.executable, "-u", str(self.repo_root / "services" / "worker" / "stream_fleet_openvino.py")]
+        logger.info(
+            "starting camera worker",
+            extra={"event": "worker_starting", "revision": desired.revision,
+                   "camera_count": len(desired.cameras)},
+        )
         new_process = subprocess.Popen(command, cwd=str(self.repo_root), env=env)
         deadline = time.monotonic() + float(os.getenv("WORKER_SUPERVISOR_STARTUP_SECONDS", "3"))
         while time.monotonic() < deadline:
@@ -171,6 +183,11 @@ class WorkerSupervisor:
             self.state.applied_count += 1
             self.state.latest_error = ""
         self.state.record_event("desired_state_applied", {"revision": desired.revision, "worker_pid": new_process.pid})
+        logger.info(
+            "camera worker started",
+            extra={"event": "worker_started", "revision": desired.revision,
+                   "worker_pid": new_process.pid, "camera_count": len(desired.cameras)},
+        )
 
     def poll_worker(self) -> None:
         proc = self.process
@@ -284,6 +301,10 @@ class DesiredStateReloader(threading.Thread):
             self.state.rejected_count += 1
             self.state.last_reload_at = time.time()
         self.state.record_event("desired_state_rejected", {"reason": reason})
+        logger.error(
+            "desired state rejected",
+            extra={"event": "desired_state_rejected", "reason": reason},
+        )
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):
@@ -416,6 +437,73 @@ def _timestamp_age(value: Any, now: float) -> float | None:
     return max(0.0, now - observed)
 
 
+def _metric_camera_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))[:160] or "camera"
+
+
+def _camera_operational_status(
+    metrics_root: Path, camera_id: str, now: float
+) -> dict[str, Any] | None:
+    safe = _metric_camera_name(camera_id)
+    decoder = _read_json(metrics_root / f"decoder-{safe}.json")
+    supervisor = _read_json(metrics_root / f"camera-supervisor-{safe}.json")
+    if decoder is None and supervisor is None:
+        return None
+    decoder = decoder or {}
+    supervisor = supervisor or {}
+    last_frame_at = decoder.get("last_frame_at")
+    last_frame_age = _timestamp_age(last_frame_at, now)
+    decoder_sample_age = _timestamp_age(decoder.get("observed_at"), now)
+    supervisor_sample_age = _timestamp_age(supervisor.get("observed_at"), now)
+    decoder_state = str(decoder.get("state") or "starting")
+    supervisor_state = str(supervisor.get("state") or "starting")
+    if supervisor_state == "process_exited" and (
+        supervisor_sample_age is not None
+        and (decoder_sample_age is None or supervisor_sample_age <= decoder_sample_age)
+    ):
+        state, reason, retrying = "unavailable", "camera_process_exited", True
+    elif supervisor_state == "starting" and (
+        supervisor_sample_age is not None
+        and (decoder_sample_age is None or supervisor_sample_age <= decoder_sample_age)
+    ):
+        state, reason, retrying = "degraded", "worker_starting", True
+    elif decoder_state == "healthy" and last_frame_age is not None and last_frame_age <= 10.0:
+        state, reason, retrying = "healthy", "none", False
+    elif decoder_state == "healthy":
+        state, reason, retrying = "degraded", "stale_frames", True
+    elif decoder_state in {"unavailable", "retrying"}:
+        state = "unavailable"
+        reason = str(decoder.get("reason") or "stream_disconnected")
+        retrying = True
+    else:
+        state, reason, retrying = "degraded", str(
+            decoder.get("reason") or supervisor.get("state") or "worker_starting"
+        ), True
+    return {
+        "state": state,
+        "reason": reason,
+        "retrying": retrying,
+        "stream_session_id": decoder.get("stream_session_id"),
+        "camera_process_pid": supervisor.get("camera_process_pid") or decoder.get("pid"),
+        "decoder_pid": decoder.get("decoder_pid"),
+        "last_frame_at": last_frame_at,
+        "last_frame_age_seconds": round(last_frame_age, 3) if last_frame_age is not None else None,
+        "reconnects": int(decoder.get("reconnects", 0)),
+        "decoder_errors": int(decoder.get("decoder_errors", 0)),
+        "decoder_starts": int(decoder.get("decoder_starts", 0)),
+        "last_ffmpeg_exit_code": decoder.get("last_ffmpeg_exit_code"),
+        "retry_reason": decoder.get("retry_reason") or supervisor.get("retry_reason"),
+        "retry_backoff_seconds": float(
+            decoder.get("retry_backoff_seconds")
+            or supervisor.get("retry_backoff_seconds") or 0.0
+        ),
+        "sanitized_stderr": decoder.get("sanitized_stderr"),
+        "status_sample_age_seconds": (
+            round(decoder_sample_age, 3) if decoder_sample_age is not None else None
+        ),
+    }
+
+
 def _health_payload(state: RuntimeState) -> dict[str, Any]:
     """Detailed diagnostics without changing the liveness status semantics."""
     snap = state.snapshot()
@@ -467,6 +555,14 @@ def _health_payload(state: RuntimeState) -> dict[str, Any]:
             "as_of": health.get("as_of"),
             "retrying": bool(health.get("retrying")),
         }
+        operational = _camera_operational_status(metrics_root, camera_id, now)
+        if operational is not None:
+            camera["decoder"] = operational
+        delivery = _read_json(
+            metrics_root / f"sentinel-delivery-{_metric_camera_name(camera_id)}.json"
+        )
+        if delivery is not None:
+            camera["delivery"] = delivery
 
     system = _read_json(metrics_root / "system-health.json") or {
         "status": "telemetry_pending",
@@ -562,8 +658,22 @@ def _per_camera_state(snap: dict[str, Any]) -> list[dict[str, Any]]:
         if camera_id:
             latest_health[camera_id] = event
     state_root = Path(os.getenv("APEXFABRIC_STATE_ROOT", "/state"))
+    metrics_root = state_root / "metrics"
+    for camera_id in camera_ids:
+        durable_health = _read_json(
+            metrics_root / f"camera-health-{_metric_camera_name(camera_id)}.json"
+        )
+        if durable_health is None:
+            continue
+        current = latest_health.get(camera_id) or {}
+        if str(durable_health.get("observed_at") or durable_health.get("as_of") or "") >= str(
+            current.get("observed_at") or current.get("as_of") or ""
+        ):
+            latest_health[camera_id] = durable_health
     outbox_root = state_root / "sentinel_v6" / "outbox"
     for camera_id in camera_ids:
+        if camera_id in latest_health:
+            continue
         camera_outbox = outbox_root / camera_id
         if not camera_outbox.exists():
             continue
@@ -579,18 +689,41 @@ def _per_camera_state(snap: dict[str, Any]) -> list[dict[str, Any]]:
                 latest_health[camera_id] = event
             break
     states = []
+    now = time.time()
     for camera_id in camera_ids:
         health = latest_health.get(camera_id) or {}
         state = str(health.get("state") or "degraded")
         reason = str(health.get("reason") or "worker_starting")
-        states.append({
+        item = {
             "camera_id": camera_id,
             "state": state,
             "reason": reason,
             "last_reliable_at": health.get("last_reliable_at"),
             "as_of": health.get("as_of") or health.get("observed_at"),
             "retrying": state != "healthy",
-        })
+        }
+        operational = _camera_operational_status(metrics_root, camera_id, now)
+        if operational is not None:
+            # Decoder/process failures are authoritative. A healthy decoder is
+            # used when no fresher analytic health state reports degradation.
+            if operational["state"] != "healthy" or not health:
+                item.update({
+                    "state": operational["state"],
+                    "reason": operational["reason"],
+                    "last_reliable_at": operational.get("last_frame_at"),
+                    "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "retrying": operational["retrying"],
+                })
+            item.update({
+                "stream_session_id": operational.get("stream_session_id"),
+                "last_frame_age_seconds": operational.get("last_frame_age_seconds"),
+                "reconnects": operational.get("reconnects", 0),
+                "decoder_errors": operational.get("decoder_errors", 0),
+                "last_ffmpeg_exit_code": operational.get("last_ffmpeg_exit_code"),
+                "retry_reason": operational.get("retry_reason"),
+                "retry_backoff_seconds": operational.get("retry_backoff_seconds", 0.0),
+            })
+        states.append(item)
     return states
 
 
@@ -726,6 +859,62 @@ def _metrics(state: RuntimeState) -> str:
                 f'{{camera_id="{camera}",device="{device_label}"}} '
                 f'{float(values.get("attributed_stage_wall_ms_per_second", 0.0)) / 1000.0}'
             )
+    for path in sorted(metrics_root.glob("decoder-*.json")) if metrics_root.exists() else ():
+        payload = _read_json(path)
+        if payload is None or not payload.get("camera_id"):
+            continue
+        camera = _prometheus_label(str(payload["camera_id"]))
+        last_frame_age = _timestamp_age(payload.get("last_frame_at"), time.time())
+        if last_frame_age is not None:
+            lines.append(
+                f'sentinel_camera_last_frame_age_seconds{{camera_id="{camera}"}} '
+                f'{last_frame_age}'
+            )
+        lines.append(
+            f'sentinel_camera_reconnects_total{{camera_id="{camera}"}} '
+            f'{int(payload.get("reconnects", 0))}'
+        )
+        lines.append(
+            f'sentinel_camera_decoder_errors_total{{camera_id="{camera}"}} '
+            f'{int(payload.get("decoder_errors", 0))}'
+        )
+    for path in sorted(metrics_root.glob("sentinel-delivery-*.json")) if metrics_root.exists() else ():
+        payload = _read_json(path)
+        if payload is None or not payload.get("camera_id"):
+            continue
+        camera = _prometheus_label(str(payload["camera_id"]))
+        for kind, values in sorted((payload.get("artifacts") or {}).items()):
+            artifact = _prometheus_label(str(kind))
+            labels = f'camera_id="{camera}",artifact="{artifact}"'
+            lines.append(
+                f'sentinel_outbox_pending_objects{{{labels}}} '
+                f'{int(values.get("pending_count", 0))}'
+            )
+            lines.append(
+                f'sentinel_outbox_pending_bytes{{{labels}}} '
+                f'{int(values.get("pending_bytes", 0))}'
+            )
+            lines.append(
+                f'sentinel_outbox_oldest_pending_age_seconds{{{labels}}} '
+                f'{float(values.get("oldest_pending_age_seconds", 0.0))}'
+            )
+            lines.append(
+                f'sentinel_upload_attempts_total{{{labels}}} '
+                f'{int(values.get("upload_attempts_total", 0))}'
+            )
+            lines.append(
+                f'sentinel_upload_acknowledgements_total{{{labels}}} '
+                f'{int(values.get("acknowledgements_total", 0))}'
+            )
+            lines.append(
+                f'sentinel_upload_retries_total{{{labels}}} '
+                f'{int(values.get("retries_total", 0))}'
+            )
+            for reason, count in sorted((values.get("http_rejections") or {}).items()):
+                lines.append(
+                    f'sentinel_upload_http_rejections_total{{{labels},'
+                    f'reason="{_prometheus_label(str(reason))}"}} {int(count)}'
+                )
     cgroup = system.get("container_cgroup") or {}
     if isinstance(cgroup.get("cpu_cores_used"), (int, float)):
         lines.append(f'sentinel_container_cpu_cores {float(cgroup["cpu_cores_used"])}')
@@ -1063,7 +1252,10 @@ def main() -> int:
     retention.start()
     RuntimeHandler.runtime_state = state
     server = ThreadingHTTPServer((args.host, args.port), RuntimeHandler)
-    print(f"traffic-pilot solution API listening on {args.host}:{args.port}", flush=True)
+    logger.info(
+        "solution API listening",
+        extra={"event": "http_server_listening"},
+    )
     try:
         server.serve_forever()
     finally:
