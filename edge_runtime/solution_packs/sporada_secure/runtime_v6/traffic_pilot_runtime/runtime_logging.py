@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 
-_URL = re.compile(r"(?i)\b(?:rtsp|rtsps|rtmp|rtmps|http|https)://[^\s\"']+")
+_URL = re.compile(r"(?i)\b(?:rtsp|rtsps|rtmp|rtmps|http|https|tcp)://[^\s\"']+")
 _BEARER = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+")
 _SECRET = re.compile(
     r"(?i)(token|password|passwd|credential|secret|api[_-]?key)(\s*[:=]\s*)[^\s,;&]+"

@@ -41,13 +41,15 @@ def _die_with_parent():
     except Exception:  # noqa: BLE001
         pass
 
-STREAM_SCHEMES = ("rtsp://", "rtsps://", "rtmp://", "http://", "https://")
+STREAM_SCHEMES = ("rtsp://", "rtsps://", "rtmp://", "http://", "https://", "tcp://")
 _HW = os.getenv("OV_DECODE_HW", "1") != "0"
 _VAAPI_DEVICE = os.getenv("VAAPI_DEVICE", "/dev/dri/renderD128")
 
 
 def _network_input_options(uri: str, *, probe: bool) -> list[str]:
     lowered = uri.lower()
+    if lowered.startswith("tcp://"):
+        return ["-rw_timeout", "30000000"]
     if lowered.startswith(("rtsp://", "rtsps://")):
         timeout_option = "-rw_timeout" if probe else "-timeout"
         return ["-rtsp_transport", "tcp", timeout_option, "30000000"]

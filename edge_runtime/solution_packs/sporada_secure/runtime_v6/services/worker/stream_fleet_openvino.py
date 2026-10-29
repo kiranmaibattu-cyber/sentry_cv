@@ -6,8 +6,11 @@ OpenVINO model and feeds all detections into the existing analytics/output path.
 
 Architecture: SHARED-NOTHING MULTIPROCESS — one process per camera, each running
 decode -> detect -> plate -> OCR -> analytics -> publish entirely on its own, with
-its own ov.Core, detectors, OCR queue, tracker and analytics publisher. Processes share
-the iGPU/NPU only at the driver level (compute contention), never the GIL.
+its own OCR queue, tracker and analytics publisher. For multi-camera deployments,
+the mandatory vehicle/person detector is compiled once in a dedicated GPU service;
+camera processes send only its 640x640 letterboxed input and receive detections.
+This avoids multiplying Intel GPU compiled-model resources per camera while keeping
+decode, tracking, policy and delivery isolated from peer camera failures.
 
 Why processes, not threads: the per-frame consume work (YOLO postprocess, tracking,
 analytics, payload build) is CPU-bound Python. The GIL serializes it, so a thread-
@@ -20,9 +23,11 @@ no crop IPC. Each process is fully independent.
 from __future__ import annotations
 
 import logging
+from multiprocessing.managers import BaseManager
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any
 import uuid
@@ -65,6 +70,11 @@ MOTION_CONFIRM_NEED = int(os.getenv("SENTINEL_MOTION_CONFIRM_NEED", "4"))
 MOTION_RELEASE_MISSES = int(os.getenv("SENTINEL_MOTION_RELEASE_MISSES", "6"))
 MOTION_SWEEP_SECONDS = float(os.getenv("SENTINEL_MOTION_SWEEP_SECONDS", "5.0"))
 MOTION_REDET_EVERY = int(os.getenv("SENTINEL_MOTION_REDET_EVERY", "25"))
+GPU_RESOURCE_BACKOFF_INITIAL_S = float(os.getenv("GPU_RESOURCE_BACKOFF_INITIAL_S", "0.05"))
+GPU_RESOURCE_BACKOFF_MAX_S = float(os.getenv("GPU_RESOURCE_BACKOFF_MAX_S", "0.5"))
+SHARED_VEHICLE_INFERENCE = os.getenv(
+    "SENTINEL_SHARED_VEHICLE_INFERENCE", "true"
+).lower() in {"1", "true", "yes", "on"}
 
 
 def require_accelerator_device(label: str, requested: str) -> None:
@@ -88,12 +98,97 @@ VEHICLE_CLASS_NAMES = {
     7: "pedestrian",
 }
 VEHICLE_CLASS_IDS = set(VEHICLE_CLASS_NAMES)
-STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
+STREAM_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://", "tcp://")
 
 
 def should_evaluate_fire_smoke(detector, frame_index: int, *, idle_sweep: bool) -> bool:
     """Respect the model cadence during activity and force idle safety sweeps."""
     return bool(detector is not None and (idle_sweep or detector.should_process(frame_index)))
+
+
+def is_transient_gpu_resource_error(exc: BaseException) -> bool:
+    """Identify Intel OpenCL pressure that can be retried on a later frame."""
+    message = str(exc).upper()
+    return "CL_OUT_OF_RESOURCES" in message or "ERROR CODE: -5" in message
+
+
+class SharedVehicleInferenceService:
+    """One compiled vehicle/person detector shared by all camera processes."""
+
+    def __init__(self, model_xml: str, confidence: float):
+        import numpy as np
+        from detectors.backends.openvino_detector import OpenVINOYOLODetector
+
+        self._lock = threading.Lock()
+        self._detector = OpenVINOYOLODetector(
+            model_xml, "vehicle", device=VEHICLE_DEVICE, imgsz=640,
+            confidence=confidence, class_ids=VEHICLE_CLASS_IDS,
+            class_names=VEHICLE_CLASS_NAMES,
+        )
+        self._request = self._detector._compiled.create_infer_request()
+        dummy = np.zeros((640, 640, 3), np.uint8)
+        for _ in range(2):
+            self._detector.infer_letterboxed(dummy, request=self._request)
+
+    def execution_devices(self) -> str:
+        return self._detector.exec_devices
+
+    def infer(self, canvas):
+        with self._lock:
+            try:
+                return {
+                    "output": self._detector.infer_letterboxed(
+                        canvas, request=self._request
+                    ),
+                    "error": None,
+                }
+            except RuntimeError as exc:
+                return {"output": None, "error": str(exc)}
+
+    def reset_request(self) -> None:
+        with self._lock:
+            self._request = self._detector._compiled.create_infer_request()
+
+
+class SharedVehicleInferenceManager(BaseManager):
+    pass
+
+
+SharedVehicleInferenceManager.register(
+    "VehicleInferenceService", SharedVehicleInferenceService
+)
+
+
+class SharedVehicleDetectorClient:
+    """Camera-side adapter preserving the local detector interface."""
+
+    def __init__(self, service, confidence: float):
+        self._service = service
+        self.confidence = confidence
+        self.exec_devices = service.execution_devices()
+
+    def warmup(self, n: int = 2) -> None:
+        del n  # The shared service is warmed before camera processes start.
+
+    def reset_request(self) -> None:
+        self._service.reset_request()
+
+    def detect(self, bgr):
+        from detectors.backends.openvino_detector import letterbox, yolo_detections
+
+        if bgr is None or bgr.size == 0:
+            return []
+        canvas, scale, pad_x, pad_y = letterbox(bgr, 640)
+        response = self._service.infer(canvas)
+        if response["error"]:
+            raise RuntimeError(response["error"])
+        h, w = bgr.shape[:2]
+        return yolo_detections(
+            response["output"], image_shape=(h, w), scale=scale,
+            pad_x=pad_x, pad_y=pad_y, confidence=self.confidence,
+            class_ids=VEHICLE_CLASS_IDS, class_names=VEHICLE_CLASS_NAMES,
+            model_name="vehicle",
+        )
 
 
 def load_cameras() -> list[dict]:
@@ -243,8 +338,8 @@ def consume_packet(packet, geo, tracker, analytics_stage, stab, async_ocr):
         analytics_stage.process([packet])
 
 
-def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: int,
-                 stream_key: str) -> None:
+def _camera_proc_impl(cam: dict, camera_config: dict, redis_host: str, redis_port: int,
+                      stream_key: str, vehicle_service=None) -> None:
     """Child process: owns ONE camera end to end. Builds its own Core, detectors,
     OCR, tracker/analytics stages, decoder and analytics publisher - no shared state."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -325,11 +420,17 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
     shared_core()  # per-process singleton Core + CACHE_DIR
     vehicle_config = ((worker_config.get("models") or {}).get("vehicle") or {})
     plate_config = ((worker_config.get("models") or {}).get("plate") or {})
-    veh = OpenVINOYOLODetector(
-        openvino_model_path("vehicle_yolo26n_fp16_dynamic"), "vehicle",
-        device=VEHICLE_DEVICE, imgsz=640,
-        confidence=float(os.getenv("VEHICLE_CONF", str(vehicle_config.get("minimum_confidence", 0.3)))),
-        class_ids=VEHICLE_CLASS_IDS, class_names=VEHICLE_CLASS_NAMES)
+    vehicle_confidence = float(os.getenv(
+        "VEHICLE_CONF", str(vehicle_config.get("minimum_confidence", 0.3))
+    ))
+    if vehicle_service is None:
+        veh = OpenVINOYOLODetector(
+            openvino_model_path("vehicle_yolo26n_fp16_dynamic"), "vehicle",
+            device=VEHICLE_DEVICE, imgsz=640, confidence=vehicle_confidence,
+            class_ids=VEHICLE_CLASS_IDS, class_names=VEHICLE_CLASS_NAMES,
+        )
+    else:
+        veh = SharedVehicleDetectorClient(vehicle_service, vehicle_confidence)
     plate = None
     if enable_plate:
         plate = OpenVINOYOLODetector(
@@ -508,6 +609,7 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
         stream_session_id=stream_session_id,
     )
     fidx = 0
+    consecutive_gpu_resource_failures = 0
     last = time.time()
     report_n = 0
     try:
@@ -537,15 +639,44 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
             gate_state, gate_ran, gate_reason = motion_gate.update(
                 frame, frame_received_at, camera_fps
             )
-        telemetry.frame(inferred=gate_ran)
+        # Count decode immediately. Active frames become inference frames only
+        # after the mandatory detector actually succeeds.
+        telemetry.frame(inferred=False if not gate_ran else None)
 
         if not gate_ran:
             if v6_pipeline is not None:
                 with telemetry.measure("event_policy.quiet_lifecycle"):
                     v6_pipeline.process_quiet(frame_received_at, fidx)
         else:
-            with telemetry.measure("detection.vehicle_person", device=VEHICLE_DEVICE):
-                raw_vdets = veh.detect(frame)
+            try:
+                with telemetry.measure("detection.vehicle_person", device=VEHICLE_DEVICE):
+                    raw_vdets = veh.detect(frame)
+            except RuntimeError as exc:
+                if not is_transient_gpu_resource_error(exc):
+                    raise
+                consecutive_gpu_resource_failures += 1
+                telemetry.count("gpu_resource_rejections")
+                veh.reset_request()
+                backoff = min(
+                    GPU_RESOURCE_BACKOFF_MAX_S,
+                    GPU_RESOURCE_BACKOFF_INITIAL_S
+                    * (2 ** min(consecutive_gpu_resource_failures - 1, 4)),
+                )
+                log_event(
+                    log, logging.WARNING, "gpu_inference_resource_retry",
+                    "GPU inference resource pressure; frame skipped and request reset",
+                    consecutive_failures=consecutive_gpu_resource_failures,
+                    retry_backoff_seconds=backoff,
+                )
+                telemetry.observe_latency(
+                    "pipeline.frame_processing_total",
+                    time.perf_counter() - frame_processing_started,
+                )
+                telemetry.maybe_flush()
+                time.sleep(backoff)
+                continue
+            consecutive_gpu_resource_failures = 0
+            telemetry.inference_succeeded()
             vdets = deduplicate_vehicles(
                 raw_vdets,
                 iou_threshold=float(os.getenv(
@@ -673,6 +804,36 @@ def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: in
     telemetry.close()
 
 
+def _camera_proc(cam: dict, camera_config: dict, redis_host: str, redis_port: int,
+                 stream_key: str, vehicle_service=None) -> None:
+    """Run one camera while preserving the real Python failure in structured logs.
+
+    Some Intel GPU plugin releases can abort while Python unwinds a live
+    ``CompiledModel`` after an unhandled exception.  Exiting directly after the
+    traceback prevents that destructor failure from replacing the original
+    error with a misleading SIGSEGV/longjmp flood.  The fleet supervisor still
+    observes a non-zero exit and applies its normal camera-local restart policy.
+    """
+    try:
+        _camera_proc_impl(
+            cam, camera_config, redis_host, redis_port, stream_key,
+            vehicle_service,
+        )
+    except BaseException as exc:  # noqa: BLE001 - child-process failure boundary
+        log.exception(
+            "camera process failed; exiting without unsafe OpenVINO teardown",
+            extra={
+                "event": "camera_process_unhandled_exception",
+                "exception_type": type(exc).__name__,
+            },
+        )
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(70)
+
+
 def main() -> int:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import multiprocessing as mp
@@ -694,9 +855,34 @@ def main() -> int:
     SystemMonitor.from_env(interval=float(os.getenv("SYSTEM_MONITOR_INTERVAL", "2"))).start()
 
     ctx = mp.get_context("spawn")
+    vehicle_manager = None
+    vehicle_service = None
+    if SHARED_VEHICLE_INFERENCE and len(cams) > 1 and VEHICLE_DEVICE.split(".")[0] == "GPU":
+        from detectors.base import openvino_model_path
+        from pipeline.config import load_worker_config
+
+        worker_config = load_worker_config()
+        vehicle_config = ((worker_config.get("models") or {}).get("vehicle") or {})
+        vehicle_confidence = float(os.getenv(
+            "VEHICLE_CONF", str(vehicle_config.get("minimum_confidence", 0.3))
+        ))
+        vehicle_manager = SharedVehicleInferenceManager(ctx=ctx)
+        vehicle_manager.start()
+        vehicle_service = vehicle_manager.VehicleInferenceService(
+            openvino_model_path("vehicle_yolo26n_fp16_dynamic"),
+            vehicle_confidence,
+        )
+        log_event(
+            log, logging.INFO, "shared_vehicle_inference_started",
+            "shared vehicle/person GPU inference service started",
+            execution_devices=vehicle_service.execution_devices(),
+            camera_count=len(cams), input_size=640,
+        )
+
     def start_camera(camera):
         process = ctx.Process(target=_camera_proc, name=f"cam-{camera['name']}", daemon=False,
-                              args=(camera, build_camera_config(camera), rhost, rport, skey))
+                              args=(camera, build_camera_config(camera), rhost, rport, skey,
+                                    vehicle_service))
         process.start()
         increment_supervisor_status(
             camera["name"], "process_starts", state="starting",
@@ -712,8 +898,9 @@ def main() -> int:
     log_event(
         log, logging.INFO, "camera_process_fleet_started",
         "camera process fleet started",
-        camera_count=len(procs), architecture="shared-nothing",
-        openvino_core_per_camera=True,
+        camera_count=len(procs), architecture="isolated-camera-processes",
+        shared_vehicle_inference=vehicle_service is not None,
+        openvino_core_per_camera=vehicle_service is None,
     )
 
     try:
@@ -767,6 +954,8 @@ def main() -> int:
                 p.terminate()
         for p in procs:
             p.join(timeout=3)
+        if vehicle_manager is not None:
+            vehicle_manager.shutdown()
     return 1
 
 

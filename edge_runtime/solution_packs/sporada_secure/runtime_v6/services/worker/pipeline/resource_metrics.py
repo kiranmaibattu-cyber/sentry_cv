@@ -147,7 +147,16 @@ class AcceleratorSampler:
             "SENTINEL_GPU_MAX_FREQUENCY_PATH",
             "/sys/class/drm/card1/device/drm/card1/gt_max_freq_mhz",
         ))
+        self.gpu_rc6_path = Path(os.getenv(
+            "SENTINEL_GPU_RC6_RESIDENCY_PATH",
+            "/sys/class/drm/card1/device/drm/card1/gt/gt1/rc6_residency_ms",
+        ))
+        self.gpu_rc6_enable_path = Path(os.getenv(
+            "SENTINEL_GPU_RC6_ENABLE_PATH",
+            "/sys/class/drm/card1/device/drm/card1/gt/gt1/rc6_enable",
+        ))
         self._last_npu_busy = _read_number(self.npu_busy_path)
+        self._last_gpu_rc6 = _read_number(self.gpu_rc6_path)
         self._last_mono = time.monotonic()
 
     def sample(self) -> dict[str, dict[str, Any]]:
@@ -166,11 +175,36 @@ class AcceleratorSampler:
         npu_max_frequency = _read_number(self.npu_max_frequency_path)
         gpu_frequency = _read_number(self.gpu_frequency_path)
         gpu_max_frequency = _read_number(self.gpu_max_frequency_path)
+        gpu_rc6 = _read_number(self.gpu_rc6_path)
+        gpu_rc6_enabled = _read_number(self.gpu_rc6_enable_path)
+        gpu_utilization = None
+        if (
+            gpu_rc6_enabled not in (None, 0)
+            and gpu_rc6 is not None
+            and self._last_gpu_rc6 is not None
+            and gpu_rc6 >= self._last_gpu_rc6
+        ):
+            # RC6 is the Intel GT low-power idle state. Its cumulative residency
+            # gives a real node-device active-residency measurement without
+            # pretending that model wall time is hardware utilization.
+            idle_ms = gpu_rc6 - self._last_gpu_rc6
+            elapsed_ms = elapsed * 1000.0
+            gpu_utilization = min(100.0, max(0.0, 100.0 * (1.0 - idle_ms / elapsed_ms)))
+        self._last_gpu_rc6 = gpu_rc6
         return {
             "GPU": {
                 "scope": "node_device",
-                "hardware_utilization_pct": None,
-                "hardware_measurement_status": "counter_unavailable",
+                "hardware_utilization_pct": (
+                    round(gpu_utilization, 2) if gpu_utilization is not None else None
+                ),
+                "hardware_measurement_status": (
+                    "measured" if gpu_utilization is not None else "counter_unavailable"
+                ),
+                "utilization_counter": str(self.gpu_rc6_path) if gpu_utilization is not None else None,
+                "utilization_semantics": (
+                    "non_rc6_active_residency; node-wide GT activity, not per-process engine busy"
+                    if gpu_utilization is not None else None
+                ),
                 "current_frequency_mhz": gpu_frequency,
                 "max_frequency_mhz": gpu_max_frequency,
             },

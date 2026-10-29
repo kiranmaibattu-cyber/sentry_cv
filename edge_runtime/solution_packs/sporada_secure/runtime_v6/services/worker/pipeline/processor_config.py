@@ -14,7 +14,7 @@ DEFAULT_PROCESSOR_CONFIG_URL = (
     "http://proxy/api/cameras/processor-config"
     "?limit=5&offset=0&configured_only=false"
 )
-STREAM_SCHEMES = ("rtsp://", "rtsps://", "rtmp://", "http://", "https://")
+STREAM_SCHEMES = ("rtsp://", "rtsps://", "rtmp://", "http://", "https://", "tcp://")
 USE_CASE_RULES = {
     "vehicle_counting": {
         "line_purposes": {"object_counting", "vehicle_counting"},

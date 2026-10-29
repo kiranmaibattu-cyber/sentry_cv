@@ -95,9 +95,18 @@ class CameraTelemetry:
             self._counters[name] += int(value)
             self._window_counters[name] += int(value)
 
-    def frame(self, *, inferred: bool) -> None:
+    def frame(self, *, inferred: bool | None) -> None:
+        """Record a decoded frame and its completed processing disposition.
+
+        ``None`` means inference was requested but did not complete, so the
+        frame must not inflate either successful inference FPS or quiet FPS.
+        """
         self.count("decoded_frames")
-        self.count("inference_frames" if inferred else "quiet_frames")
+        if inferred is not None:
+            self.count("inference_frames" if inferred else "quiet_frames")
+
+    def inference_succeeded(self) -> None:
+        self.count("inference_frames")
 
     @contextmanager
     def measure(self, stage: str, *, device: str | None = None) -> Iterator[None]:

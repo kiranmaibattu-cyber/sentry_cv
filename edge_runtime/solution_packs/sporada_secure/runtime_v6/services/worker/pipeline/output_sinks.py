@@ -869,7 +869,9 @@ def camera_payload(
     events = simple_events(packet.analytics_events)
     frame_height, frame_width = packet.frame.shape[:2]
     return {
-        "schema_version": "5.0",
+        # This is an optional operator/debug stream, not a Management wire
+        # object. Keep its version namespace distinct from Sentry contracts.
+        "internal_format": "camera-analytics-v1",
         "message_type": "camera_analytics",
         "message_id": f"{packet.name}:{sequence}:{now}",
         "sequence": sequence,

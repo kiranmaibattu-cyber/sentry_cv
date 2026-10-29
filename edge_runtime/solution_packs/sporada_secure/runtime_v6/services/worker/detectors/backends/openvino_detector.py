@@ -7,8 +7,10 @@ letterboxed-input pixel coordinates, rows sorted by score descending).
 Best practices baked in (docs.openvino.ai, 2024/2025):
 - ONE shared ov.Core with CACHE_DIR, so GPU `.cl_cache` / NPU `.blob` are reused
   across worker restarts (compile is otherwise re-paid every launch).
-- Compile with PERFORMANCE_HINT=THROUGHPUT: the per-camera threads each issue
-  inference concurrently, so OV sizes streams to saturate the device.
+- Compile with PERFORMANCE_HINT=LATENCY and one GPU stream.  A detector in this
+  runtime receives one synchronous frame at a time; allocating a throughput
+  stream pool in every camera process multiplies GPU resources without adding
+  per-camera concurrency.
 - PrePostProcessor folds color (BGR->RGB) + layout (NHWC->NCHW) + scale (/255)
   ONTO the device. We feed a uint8 NHWC letterboxed tensor and do zero per-pixel
   float work in Python. (Letterbox itself stays in cv2 — PPP `resize` would not
@@ -22,6 +24,8 @@ import logging
 import os
 import threading
 from typing import Iterable, Optional
+
+import fcntl
 
 import cv2
 import numpy as np
@@ -65,6 +69,45 @@ def letterbox(image: np.ndarray, size: int):
     return canvas, s, px, py
 
 
+def yolo_detections(
+    output: np.ndarray,
+    *,
+    image_shape: tuple[int, int],
+    scale: float,
+    pad_x: int,
+    pad_y: int,
+    confidence: float,
+    class_ids: Optional[set[int]],
+    class_names: dict,
+    model_name: str,
+    max_detections: Optional[int] = None,
+) -> list[Detection]:
+    """Convert one NMS-baked YOLO result back to source-frame coordinates."""
+    h, w = image_shape
+    detections: list[Detection] = []
+    for row in output[0]:
+        score = float(row[4])
+        if score < confidence:
+            break
+        cls = int(row[5])
+        if class_ids is not None and cls not in class_ids:
+            continue
+        x1 = int(max(0, min(w, (row[0] - pad_x) / scale)))
+        y1 = int(max(0, min(h, (row[1] - pad_y) / scale)))
+        x2 = int(max(0, min(w, (row[2] - pad_x) / scale)))
+        y2 = int(max(0, min(h, (row[3] - pad_y) / scale)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        detections.append(Detection(
+            bbox=[x1, y1, x2, y2], class_id=cls,
+            class_name=class_names.get(cls, model_name),
+            confidence=score, model_name=model_name,
+        ))
+        if max_detections and len(detections) >= max_detections:
+            break
+    return detections
+
+
 class OpenVINOYOLODetector:
     """YOLO detector (NMS-baked, [1,N,6] output) on OpenVINO. detect(bgr) -> [Detection]."""
 
@@ -80,7 +123,7 @@ class OpenVINOYOLODetector:
         class_names: Optional[dict] = None,
         max_detections: Optional[int] = None,
         cache_dir: str = "/tmp/ov_cache",
-        performance_hint: str = "THROUGHPUT",
+        performance_hint: str = "LATENCY",
     ):
         import openvino as ov
         from openvino import Layout, Type
@@ -96,6 +139,7 @@ class OpenVINOYOLODetector:
         self.class_names = class_names or {}
         self.max_detections = max_detections
         self._tls = threading.local()
+        self._infer_lock_fd = None
 
         core = shared_core(cache_dir)
         model = core.read_model(model_xml)
@@ -120,6 +164,23 @@ class OpenVINOYOLODetector:
         self._compiled = core.compile_model(model, device, options)
         self._out = self._compiled.output(0)
         self.device = device
+        if (
+            device.split(".")[0] == "GPU"
+            and os.getenv("SENTINEL_SERIALIZE_GPU_DETECTION", "true").lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            # Multiple camera processes fed from the same TCP MPEG-TS source
+            # receive frames in lockstep. Intel's GPU plugin can reject
+            # concurrent clFinish calls with CL_OUT_OF_RESOURCES even when each
+            # process owns only one InferRequest. A container-local file lock
+            # keeps the short synchronous detector calls bounded while decode,
+            # tracking, policy and delivery remain parallel per camera.
+            lock_path = os.getenv(
+                "SENTINEL_GPU_DETECTION_LOCK",
+                "/tmp/sentinel/gpu-detection.lock",
+            )
+            os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+            self._infer_lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             self.exec_devices = ",".join(self._compiled.get_property("EXECUTION_DEVICES"))
         except Exception:  # noqa: BLE001
@@ -135,37 +196,41 @@ class OpenVINOYOLODetector:
             self._tls.req = req
         return req
 
+    def reset_request(self) -> None:
+        """Discard a failed thread-local request before a bounded retry.
+
+        Intel's GPU plugin can leave a synchronous request unusable after
+        ``CL_OUT_OF_RESOURCES``.  The compiled model remains valid, so the next
+        call can create a fresh request without recompiling the model.
+        """
+        if hasattr(self._tls, "req"):
+            del self._tls.req
+
     def warmup(self, n: int = 2) -> None:
         dummy = np.zeros((1, self.imgsz, self.imgsz, 3), np.uint8)
         req = self._request()
         for _ in range(n):
             req.infer({0: dummy})
 
+    def infer_letterboxed(self, canvas: np.ndarray, *, request=None) -> np.ndarray:
+        """Infer one uint8 NHWC letterboxed image and return a detached result."""
+        if self._infer_lock_fd is not None:
+            fcntl.flock(self._infer_lock_fd, fcntl.LOCK_EX)
+        try:
+            req = request if request is not None else self._request()
+            return np.asarray(req.infer({0: canvas[None]})[self._out]).copy()
+        finally:
+            if self._infer_lock_fd is not None:
+                fcntl.flock(self._infer_lock_fd, fcntl.LOCK_UN)
+
     def detect(self, bgr: np.ndarray) -> list[Detection]:
         if bgr is None or bgr.size == 0:
             return []
         canvas, scale, px, py = letterbox(bgr, self.imgsz)
-        out = self._request().infer({0: canvas[None]})[self._out]  # [1, N, 6]
         h, w = bgr.shape[:2]
-        dets: list[Detection] = []
-        for row in out[0]:
-            score = float(row[4])
-            if score < self.confidence:
-                break  # NMS output is sorted by score descending
-            cls = int(row[5])
-            if self.class_ids is not None and cls not in self.class_ids:
-                continue
-            x1 = int(max(0, min(w, (row[0] - px) / scale)))
-            y1 = int(max(0, min(h, (row[1] - py) / scale)))
-            x2 = int(max(0, min(w, (row[2] - px) / scale)))
-            y2 = int(max(0, min(h, (row[3] - py) / scale)))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            dets.append(Detection(
-                bbox=[x1, y1, x2, y2], class_id=cls,
-                class_name=self.class_names.get(cls, self.model_name),
-                confidence=score, model_name=self.model_name,
-            ))
-            if self.max_detections and len(dets) >= self.max_detections:
-                break
-        return dets
+        return yolo_detections(
+            self.infer_letterboxed(canvas), image_shape=(h, w), scale=scale,
+            pad_x=px, pad_y=py, confidence=self.confidence,
+            class_ids=self.class_ids, class_names=self.class_names,
+            model_name=self.model_name, max_detections=self.max_detections,
+        )

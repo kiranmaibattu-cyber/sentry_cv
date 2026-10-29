@@ -65,7 +65,8 @@ RUN apt-get update \
         python3-gi python3-gst-1.0 \
         gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
         gstreamer1.0-tools gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-vaapi \
+        gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+        gstreamer1.0-libav gstreamer1.0-vaapi \
     && rm -rf /var/lib/apt/lists/* \
     && python -m pip install --break-system-packages --no-cache-dir jsonschema==4.23.0 \
     && ln -sf /usr/lib/x86_64-linux-gnu/libopenvino_intel_npu_compiler_loader.so \
@@ -102,11 +103,14 @@ RUN apt-get update \
     && test -f /opt/traffic-pilot/image_schema/desired-state.example.json \
     && test -f /opt/traffic-pilot/image_schema/observation-examples.json \
     && test -f /opt/traffic-pilot/image_schema/acknowledgement.example.json \
+    && gst-inspect-1.0 tcpclientsrc >/dev/null \
+    && gst-inspect-1.0 tsdemux >/dev/null \
+    && gst-inspect-1.0 h264parse >/dev/null \
     && mkdir -p /tmp/sentinel/cache \
     && chown -R apexruntime:apexruntime /tmp/sentinel \
     && test "$(id -u apexruntime)" = "10001"
 
-ARG IMAGE_VERSION=2026.10.28-v6-dev22
+ARG IMAGE_VERSION=2026.10.29-v6-dev24
 ARG INTEL_TRAFFIC_RUNTIME_BASE_DIGEST=unresolved
 
 LABEL org.opencontainers.image.source="https://github.com/kiranmaibattu-cyber/sentry_cv" \

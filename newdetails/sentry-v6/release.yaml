@@ -2,10 +2,10 @@ contract: sentry-v6
 schema_version: "6.0"
 wire_schema_version: "6.0"
 status: published-development
-image: ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22
-registry_digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
-local_digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
-image_id: ef8488352e2a4497c2f9249bd98e1a0f9dc53d45ee7152efd354ff90b13aec55
+image: ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25
+registry_digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
+local_digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
+image_id: cb5ec20698878feec22ac108902c5ab344e2b3af78e665658a2a298c49dab132
 architecture: amd64
 hardware_profile: intel-285h
 changes:
@@ -28,24 +28,34 @@ changes:
   - observation_evidence_and_embedding_outbox_delivery_metrics
   - latest_camera_health_cache_independent_of_acknowledged_outbox_records
   - corrected_console_summary_from_current_per_camera_telemetry
+  - mpeg_ts_over_tcp_through_the_existing_vaapi_pipeline
+  - shared_single_model_vehicle_gpu_inference_service_for_multi_camera_runtime
+  - transient_gpu_resource_failure_does_not_create_false_empty_observations
+  - measured_gpu_non_rc6_activity_and_npu_busy_time_without_synthetic_zeroes
+  - canonical_desired_state_example_embedded_in_the_image
+  - removed_inactive_v4_scene_and_person_reid_publishers
+  - optional_operator_analytics_uses_an_internal_format_namespace
 validation:
-  runtime_tests: 58
+  runtime_tests: 65
   schemas: 5
   event_examples: 16
   accepted_camera_configuration_counts: [1, 8, 16, 50]
   rejected_camera_configuration_counts: [51]
-  live_rtsps:
+  live_tcp_five_camera_same_source:
+    validation_image: intel-285h-2026.10.29-v6-dev24
+    dev25_note: inherited_result_active_decode_inference_and_delivery_paths_unchanged
+    source: tcp_mpeg_ts_h264_1920x1080
     target_fps: 5
-    stable_decoded_fps: 5.255
-    observations_persisted_final_image: 32
-    evidence_persisted_final_image: 17
-    embeddings_persisted_final_image: 14
-    forced_decoder_reconnects: 1
-    decoder_errors_recorded: 1
-    recovered_without_pod_restart: true
-  one_camera_full_app_memory:
-    podman_working_set_gib: [1.9, 2.0]
-    cgroup_memory_current_gib: [3.2, 3.4]
+    decoded_fps: [5.016, 5.016, 5.020, 5.020, 4.978]
+    inference_fps: [5.016, 5.016, 5.020, 5.020, 4.978]
+    reconnects: 0
+    decoder_errors: 0
+    gpu_resource_rejections: 0
+    container_memory_gib: 2.08
+  peer_camera_outage_isolation:
+    healthy_camera_decoded_fps: 4.98
+    failed_camera_state: unavailable
+    readiness_http_status: 200
   delivery_http_exchange_test: observation_then_evidence_then_embedding_acknowledged
 known_issues:
   - 50_camera_configuration_limit_is_not_a_50_camera_full_app_throughput_claim

@@ -11,11 +11,11 @@ container startup.
 ## Current V6 Image Candidate
 
 ```text
-ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22
-image ID: ef8488352e2a4497c2f9249bd98e1a0f9dc53d45ee7152efd354ff90b13aec55
-local digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
+ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25
+image ID: cb5ec20698878feec22ac108902c5ab344e2b3af78e665658a2a298c49dab132
+local digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
 publication status: published development image in personal GHCR
-registry digest: sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b
+registry digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
 ```
 
 This is the first candidate in this repository with a true V6 wire boundary.
@@ -30,7 +30,14 @@ The image is built from:
 - `newdetails/sentry-v6`
 - baked OpenVINO/ONNX model files under `models/`
 
-Dev22 raises the V6 desired-state/configuration limit to 50 cameras, adds
+Dev25 synchronizes the canonical embedded desired-state example and removes
+inactive V4 scene/ReID publishers so only the V6 event pipeline owns durable
+Management records. Dev24 added MPEG-TS over TCP through the existing VAAPI pipeline and shares one
+compiled vehicle/person GPU model across camera processes. Five camera IDs
+consuming the same 1920x1080 TCP source held approximately 5 FPS each without
+GPU resource rejection, native crash, or decoder reconnect. Camera-local
+decode, motion gating, tracking, production policy and V6 delivery remain
+isolated. Dev22 raised the V6 desired-state/configuration limit to 50 cameras, adds
 credential-safe structured decoder/process logs, fault-aware per-camera health,
 and durable delivery/outbox telemetry for observations, evidence, and
 embeddings. It preserves schema 6.0 and `/api/v6/ingest/*`. The 50-camera value
@@ -116,14 +123,14 @@ Build the GHCR image:
 
 ```bash
 SENTINEL_IMAGE_REPOSITORY=ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime \
-SENTINEL_IMAGE_VERSION=2026.10.28-v6-dev22 \
+SENTINEL_IMAGE_VERSION=2026.10.29-v6-dev25 \
 ./scripts/build_sentinel_v6_image.sh
 ```
 
 Push it:
 
 ```bash
-podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22
+podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25
 ```
 
 ## Contract And Design Docs

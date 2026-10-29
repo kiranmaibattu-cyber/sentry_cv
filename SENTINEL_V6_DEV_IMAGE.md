@@ -1,12 +1,12 @@
 # Sentinel V6.0 Development Image
 
-Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.28-v6-dev22`
+Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25`
 
-Image ID: `ef8488352e2a4497c2f9249bd98e1a0f9dc53d45ee7152efd354ff90b13aec55`
+Image ID: `cb5ec20698878feec22ac108902c5ab344e2b3af78e665658a2a298c49dab132`
 
-Local digest: `sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b`
+Local digest: `sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3`
 
-Registry digest: `sha256:b042b3714d9548d42d67dea21948808237b1dfabe78459adbe4db6756437436b`
+Registry digest: `sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3`
 
 Publication status: pushed to the personal `kiranmaibattu-cyber` GHCR namespace.
 
@@ -21,6 +21,24 @@ profiles are initialized. Recheck, action recognition, and policy clips remain
 deferred by the contract.
 
 ## Verified
+
+- Dev25 embeds the same canonical desired-state example as the source contract.
+  Inactive V4 scene and person-ReID publishers were removed; the retained
+  SigLIP2, TransReID and GaitBase extractors are consumed by the V6 event
+  pipeline. Optional operator analytics uses an explicitly internal format
+  namespace rather than claiming a Management wire-schema version.
+
+- Dev24 accepts MPEG-TS over TCP through the existing FFmpeg VAAPI path. Five
+  camera IDs consuming the same 1920x1080 source sustained approximately 5 FPS
+  each with no GPU resource rejection, camera crash, or decoder reconnect.
+  One compiled vehicle/person GPU model is shared while tracking, production
+  policy and delivery remain camera-local.
+- Dev24 runtime tests pass: 65 tests. The schema package validates all five V6
+  schemas, 16 representative outputs and 1/8/16/50-camera desired states.
+- Dev24 health telemetry reports process/cgroup CPU and RAM, NPU busy time and
+  Intel GPU non-RC6 activity without substituting unavailable counters with
+  synthetic zeroes. A failed TCP peer did not block a healthy camera or
+  deployment readiness.
 
 - Dev22 accepts and compiles 1, 8, 16, and 50-camera desired states and rejects
   51. This validates the configuration and supervisor boundary, not guaranteed

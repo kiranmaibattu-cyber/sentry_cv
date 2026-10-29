@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .desired_state import DesiredCamera, DesiredState
 
@@ -18,6 +19,14 @@ def write_worker_config(desired: DesiredState, output_path: Path) -> dict[str, A
 
 def _camera_to_worker(camera: DesiredCamera) -> dict[str, Any]:
     uri = Path(camera.source.removeprefix("file:")).read_text(encoding="utf-8").strip()
+    scheme = urlsplit(uri).scheme.lower()
+    source_type = {
+        "rtsp": "rtsp",
+        "rtsps": "rtsp",
+        "http": "http",
+        "https": "http",
+        "tcp": "tcp",
+    }[scheme]
     v6 = camera.config["v6"]
     zones = {item["id"]: item for item in (v6.get("geometry") or {}).get("zones") or []}
     analytics: dict[str, Any] = {
@@ -53,6 +62,6 @@ def _camera_to_worker(camera: DesiredCamera) -> dict[str, Any]:
                                            "dimensions": 768}
     return {
         "camera_id": camera.camera_id, "name": camera.name or camera.camera_id,
-        "enabled": True, "source": {"type": "rtsp" if uri.startswith(("rtsp://", "rtsps://")) else "http", "uri": uri},
+        "enabled": True, "source": {"type": source_type, "uri": uri},
         "processing": {"fps": camera.fps}, "analytics": analytics,
     }

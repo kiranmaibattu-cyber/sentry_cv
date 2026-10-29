@@ -30,6 +30,14 @@ does not require every camera or every camera-local model process to be healthy.
 One desired-state revision may configure 1 through 50 cameras. Measured FPS
 and memory still depend on stream resolution and enabled analytics.
 
+Camera sources remain Secret references in desired state. The referenced file
+may contain an `rtsp://`, `rtsps://`, `http://`, `https://`, or `tcp://` URL.
+`tcp://host:port` means an MPEG-TS stream carried over TCP; H.264/H.265 parsing,
+VAAPI hardware decode, conversion, detection, reconnect handling, and URL
+redaction are the same camera-local runtime responsibilities. Multiple camera
+IDs may reference separate Secret files containing the same TCP URL when the
+upstream server supports one independent connection per consumer.
+
 The recent management changes are compatible consumers of this behavior:
 camera-health state uses the existing `healthy`, `degraded`, and `unavailable`
 vocabulary; stale health heartbeats are shown as unavailable; and the dashboard

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -32,15 +33,20 @@ from pipeline.resource_metrics import AcceleratorSampler, CgroupSampler
 from detectors.backends.openvino_ocr_async import AsyncOCR
 from detectors.backends.openvino_smoke_fire import _device_with_fallback
 from detectors.backends.openvino_face import OpenVINOFaceExtractor, _pose_quality, _rotation_to_euler
+from detectors.backends.openvino_detector import OpenVINOYOLODetector
 import decode
 from stream_fleet_openvino import (
+    SharedVehicleDetectorClient,
     VEHICLE_CLASS_IDS,
     VEHICLE_CLASS_NAMES,
+    is_transient_gpu_resource_error,
     require_accelerator_device,
     should_evaluate_fire_smoke,
 )
 from traffic_pilot_runtime.desired_state import MAX_CAMERAS, DesiredStateValidator
+from traffic_pilot_runtime.adapter import write_worker_config
 from traffic_pilot_runtime.graph import compile_runtime_plan
+from traffic_pilot_runtime.runtime_logging import _sanitize as sanitize_supervisor_log
 from traffic_pilot_runtime.solution_image_entrypoint import (
     RuntimeState, _health_payload, _hot_reload_signature, _metrics, _per_camera_state,
 )
@@ -89,6 +95,61 @@ def test_dynamic_vehicle_model_class_map_and_contract_vehicle_types():
     assert V6EventPipeline._vehicle_type("bicycle") == "other"
 
 
+def test_synchronous_vehicle_detector_defaults_to_one_stream_latency_mode():
+    parameter = inspect.signature(OpenVINOYOLODetector).parameters["performance_hint"]
+    assert parameter.default == "LATENCY"
+
+
+def test_gpu_resource_error_classifier_is_narrow():
+    assert is_transient_gpu_resource_error(RuntimeError(
+        "[GPU] clFinish, error code: -5 CL_OUT_OF_RESOURCES"
+    ))
+    assert is_transient_gpu_resource_error(RuntimeError("error code: -5"))
+    assert not is_transient_gpu_resource_error(RuntimeError("model input shape mismatch"))
+
+
+def test_detector_request_reset_discards_only_the_current_thread_request():
+    detector = OpenVINOYOLODetector.__new__(OpenVINOYOLODetector)
+    detector._tls = threading.local()
+    detector._tls.req = object()
+    detector.reset_request()
+    assert not hasattr(detector._tls, "req")
+
+
+def test_shared_vehicle_detector_client_preserves_source_coordinates():
+    class Service:
+        def execution_devices(self):
+            return "GPU.0"
+
+        def infer(self, canvas):
+            assert canvas.shape == (640, 640, 3)
+            output = np.zeros((1, 2, 6), np.float32)
+            output[0, 0] = [32, 192, 320, 480, 0.9, 1]
+            return {"output": output, "error": None}
+
+        def reset_request(self):
+            return None
+
+    detector = SharedVehicleDetectorClient(Service(), confidence=0.3)
+    detections = detector.detect(np.zeros((100, 200, 3), np.uint8))
+    assert len(detections) == 1
+    assert detections[0].class_name == "car"
+    assert detections[0].bbox == [10, 10, 100, 100]
+
+
+def test_shared_vehicle_detector_client_propagates_gpu_failure():
+    class Service:
+        def execution_devices(self):
+            return "GPU.0"
+
+        def infer(self, _canvas):
+            return {"output": None, "error": "CL_OUT_OF_RESOURCES"}
+
+    detector = SharedVehicleDetectorClient(Service(), confidence=0.3)
+    with pytest.raises(RuntimeError, match="CL_OUT_OF_RESOURCES"):
+        detector.detect(np.zeros((100, 200, 3), np.uint8))
+
+
 def test_camera_runtime_telemetry_reports_rates_latency_outputs_and_resources(
     tmp_path, monkeypatch,
 ):
@@ -100,6 +161,7 @@ def test_camera_runtime_telemetry_reports_rates_latency_outputs_and_resources(
     )
     telemetry.frame(inferred=True)
     telemetry.frame(inferred=False)
+    telemetry.frame(inferred=None)
     telemetry.observe_latency("detection.vehicle_person", 0.012, device="GPU")
     telemetry.event_persisted({
         "event_type": "object_present",
@@ -111,6 +173,9 @@ def test_camera_runtime_telemetry_reports_rates_latency_outputs_and_resources(
     assert payload["processing"]["target_fps"] == 5
     assert payload["processing"]["decoded_fps"] > 0
     assert payload["processing"]["inference_fps"] > 0
+    assert payload["processing"]["totals"]["decoded_frames"] == 3
+    assert payload["processing"]["totals"]["inference_frames"] == 1
+    assert payload["processing"]["totals"]["quiet_frames"] == 1
     assert payload["processing"]["output_events_per_second"] > 0
     assert payload["outputs"]["by_event_type"]["object_present"]["total"] == 1
     assert payload["outputs"]["by_use_case_id"]["presence-a"]["total"] == 1
@@ -305,6 +370,38 @@ def test_desired_state_rejects_more_than_fifty_cameras(tmp_path):
         validator.validate(desired)
 
 
+def test_tcp_mpeg_ts_source_uses_existing_live_worker_pipeline(tmp_path):
+    secret_root = tmp_path / "cameras"
+    secret_root.mkdir()
+    desired = desired_state_with_cameras(secret_root, 1)
+    (secret_root / "cam-00.url").write_text(
+        "tcp://127.0.0.1:9001", encoding="utf-8"
+    )
+    validator = DesiredStateValidator(secret_root)
+    validator.schema["$defs"]["camera"]["properties"]["source"]["pattern"] = (
+        r"^file:.*cam-[0-9]+\.url$"
+    )
+    loaded = validator.load(_write_desired_state(tmp_path, desired))
+    worker = write_worker_config(loaded, tmp_path / "worker.json")
+    assert worker["cameras"][0]["source"] == {
+        "type": "tcp", "uri": "tcp://127.0.0.1:9001",
+    }
+    assert decode._network_input_options(
+        "tcp://127.0.0.1:9001", probe=False
+    ) == ["-rw_timeout", "30000000"]
+    assert "tcp://127.0.0.1:9001".startswith(decode.STREAM_SCHEMES)
+
+
+def test_tcp_url_is_redacted_from_supervisor_and_worker_logs():
+    secret_url = "tcp://user:password@camera.example:9001?token=secret"
+    assert sanitize_supervisor_log(secret_url) == "<redacted-url>"
+    record = logging.LogRecord(
+        "decoder", logging.ERROR, __file__, 1, "failed %s", (secret_url,), None,
+    )
+    payload = json.loads(JsonLogFormatter().format(record))
+    assert payload["message"] == "failed <redacted-url>"
+
+
 def _write_desired_state(tmp_path: Path, payload: dict) -> Path:
     path = tmp_path / "desired-state.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -380,26 +477,35 @@ def test_cgroup_and_npu_hardware_counters_are_measured(tmp_path, monkeypatch):
     npu_max_frequency = tmp_path / "npu_max_frequency"
     gpu_frequency = tmp_path / "gpu_frequency"
     gpu_max_frequency = tmp_path / "gpu_max_frequency"
+    gpu_rc6 = tmp_path / "gpu_rc6"
+    gpu_rc6_enable = tmp_path / "gpu_rc6_enable"
     npu_busy.write_text("1000000\n", encoding="utf-8")
     npu_memory.write_text("4096\n", encoding="utf-8")
     npu_frequency.write_text("800\n", encoding="utf-8")
     npu_max_frequency.write_text("1600\n", encoding="utf-8")
     gpu_frequency.write_text("900\n", encoding="utf-8")
     gpu_max_frequency.write_text("2300\n", encoding="utf-8")
+    gpu_rc6.write_text("1000000\n", encoding="utf-8")
+    gpu_rc6_enable.write_text("1\n", encoding="utf-8")
     monkeypatch.setenv("SENTINEL_NPU_BUSY_TIME_PATH", str(npu_busy))
     monkeypatch.setenv("SENTINEL_NPU_MEMORY_PATH", str(npu_memory))
     monkeypatch.setenv("SENTINEL_NPU_FREQUENCY_PATH", str(npu_frequency))
     monkeypatch.setenv("SENTINEL_NPU_MAX_FREQUENCY_PATH", str(npu_max_frequency))
     monkeypatch.setenv("SENTINEL_GPU_FREQUENCY_PATH", str(gpu_frequency))
     monkeypatch.setenv("SENTINEL_GPU_MAX_FREQUENCY_PATH", str(gpu_max_frequency))
+    monkeypatch.setenv("SENTINEL_GPU_RC6_RESIDENCY_PATH", str(gpu_rc6))
+    monkeypatch.setenv("SENTINEL_GPU_RC6_ENABLE_PATH", str(gpu_rc6_enable))
     accelerator_sampler = AcceleratorSampler()
     time.sleep(0.01)
     npu_busy.write_text("1005000\n", encoding="utf-8")
+    gpu_rc6.write_text("1000005\n", encoding="utf-8")
     accelerators = accelerator_sampler.sample()
     assert accelerators["NPU"]["hardware_measurement_status"] == "measured"
     assert 0 < accelerators["NPU"]["hardware_utilization_pct"] <= 100
     assert accelerators["NPU"]["memory_used_bytes"] == 4096
-    assert accelerators["GPU"]["hardware_utilization_pct"] is None
+    assert accelerators["GPU"]["hardware_measurement_status"] == "measured"
+    assert 0 < accelerators["GPU"]["hardware_utilization_pct"] < 100
+    assert accelerators["GPU"]["utilization_semantics"].startswith("non_rc6")
     assert accelerators["GPU"]["current_frequency_mhz"] == 900
 
 
