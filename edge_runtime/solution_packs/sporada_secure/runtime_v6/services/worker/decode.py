@@ -44,6 +44,14 @@ def _die_with_parent():
 STREAM_SCHEMES = ("rtsp://", "rtsps://", "rtmp://", "http://", "https://", "tcp://")
 _HW = os.getenv("OV_DECODE_HW", "1") != "0"
 _VAAPI_DEVICE = os.getenv("VAAPI_DEVICE", "/dev/dri/renderD128")
+_FFMPEG_THREADS = max(1, int(os.getenv("SENTINEL_FFMPEG_THREADS", "1")))
+_OPENCV_THREADS = max(1, int(os.getenv("SENTINEL_OPENCV_THREADS", "1")))
+
+# Every camera has its own process. Letting FFmpeg and OpenCV each create a
+# host-sized CPU pool per camera exhausts the pod PID budget long before CPU,
+# GPU, NPU or memory capacity is reached. VAAPI performs the actual decode, so
+# one bounded CPU orchestration/filter thread is sufficient for this path.
+cv2.setNumThreads(_OPENCV_THREADS)
 
 
 def _network_input_options(uri: str, *, probe: bool) -> list[str]:
@@ -117,7 +125,12 @@ def _parse_probe_resolution(payload: str) -> tuple[int, int]:
 def _ffmpeg_cmd(uri: str, fps: int, is_stream: bool) -> list[str]:
     if not _HW:
         raise RuntimeError("V6.0 requires VA-API hardware decode (OV_DECODE_HW must not be 0)")
-    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    cmd = [
+        "ffmpeg", "-nostdin", "-loglevel", "error",
+        "-threads", str(_FFMPEG_THREADS),
+        "-filter_threads", str(_FFMPEG_THREADS),
+        "-filter_complex_threads", str(_FFMPEG_THREADS),
+    ]
     if _HW:
         cmd += ["-hwaccel", "vaapi", "-hwaccel_device", _VAAPI_DEVICE,
                 "-hwaccel_output_format", "vaapi"]
@@ -202,6 +215,7 @@ class FfmpegDecoder:
             logger, logging.INFO, "decoder_started", "FFmpeg decoder started",
             decoder_pid=self._proc.pid, width=self.w, height=self.h,
             target_fps=self.fps, hardware_decode=self._nv12,
+            ffmpeg_threads=_FFMPEG_THREADS, opencv_threads=_OPENCV_THREADS,
         )
 
     def _drain_stderr(self) -> None:

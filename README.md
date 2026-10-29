@@ -11,11 +11,11 @@ container startup.
 ## Current V6 Image Candidate
 
 ```text
-ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25
-image ID: cb5ec20698878feec22ac108902c5ab344e2b3af78e665658a2a298c49dab132
-local digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
-publication status: published development image in personal GHCR
-registry digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
+ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.30-v6-dev39
+image ID: d43d03ad200391a80f7f5038aca5fe0fed4481d2805bef8f610896b2e64a0cf6
+local digest: sha256:aae3a9ed26a83b9e93958b74dcd02dde7a232ff85d1301f99014243dda9b0a29
+publication status: published to personal GHCR
+registry digest: sha256:aae3a9ed26a83b9e93958b74dcd02dde7a232ff85d1301f99014243dda9b0a29
 ```
 
 This is the first candidate in this repository with a true V6 wire boundary.
@@ -30,7 +30,23 @@ The image is built from:
 - `newdetails/sentry-v6`
 - baked OpenVINO/ONNX model files under `models/`
 
-Dev25 synchronizes the canonical embedded desired-state example and removes
+Dev39 corrects timestamp provenance, records the exact parent runtime image,
+hot-reloads geometry without restarting camera sessions, and prevents motion
+quiet frames or tracker-retained predictions from creating false lifecycle
+transitions. Small/distant subjects receive bounded additional recovery
+hysteresis. Live qualification now covers face samples, line crossing, and a
+real fire/smoke transition. Dev29 adds continuous evaluated-negative hazard clearing to the bounded policy
+implemented in dev28. Dev28 added the adaptive production-policy resolver, time-based presence
+recovery, positive zone/count debounce, conservative ANPR candidate selection,
+spatially consistent hazard confirmation, and effective-policy telemetry in
+`/healthz`. It preserves the strict V6.0 wire schemas. Dev27 replaces
+manager-proxy detector tensor copies and one locked GPU request
+with private per-camera mmap slots and a fair four-request OpenVINO scheduler.
+Tracking, production policy, original-frame evidence, and V6 delivery remain
+camera-local and ordered exactly as before. See
+`SENTINEL_V6_DEV27_SHARED_INFERENCE_ARCHITECTURE.md` for the implemented and
+deferred optimization boundaries. Scheduler admission is explicitly
+non-blocking so a full request queue cannot delay completion callbacks. Dev25 synchronizes the canonical embedded desired-state example and removes
 inactive V4 scene/ReID publishers so only the V6 event pipeline owns durable
 Management records. Dev24 added MPEG-TS over TCP through the existing VAAPI pipeline and shares one
 compiled vehicle/person GPU model across camera processes. Five camera IDs
@@ -95,6 +111,7 @@ access from the container runtime:
 |---|---|
 | Decode | Intel iGPU / VAAPI |
 | YOLO person/vehicle detection | Intel GPU |
+| Fire/smoke detection | Intel NPU |
 | Face detection | Intel GPU |
 | SixDRepNet head-pose quality gate | Intel NPU |
 | Face embedding | Intel NPU |
@@ -123,14 +140,14 @@ Build the GHCR image:
 
 ```bash
 SENTINEL_IMAGE_REPOSITORY=ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime \
-SENTINEL_IMAGE_VERSION=2026.10.29-v6-dev25 \
+SENTINEL_IMAGE_VERSION=2026.10.30-v6-dev39 \
 ./scripts/build_sentinel_v6_image.sh
 ```
 
 Push it:
 
 ```bash
-podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25
+podman push ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.30-v6-dev39
 ```
 
 ## Contract And Design Docs

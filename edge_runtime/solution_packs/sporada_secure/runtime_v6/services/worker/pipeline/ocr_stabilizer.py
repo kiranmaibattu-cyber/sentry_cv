@@ -57,6 +57,8 @@ class OcrStabilizer:
         self._reads: Dict[Key, List[Tuple[str, float, float]]] = {}  # text, vote weight, OCR confidence
         self._confirmed: Dict[Key, str] = {}                   # locked plate
         self._confirmed_confidence: Dict[Key, float] = {}
+        self._confirmed_version: Dict[Key, int] = {}
+        self._read_version: Dict[Key, int] = {}
         self._provisional: Dict[Key, str] = {}                 # latest raw (display only)
         self._last_frame: Dict[Key, int] = {}
         self._attempts: Dict[Key, int] = {}
@@ -78,6 +80,7 @@ class OcrStabilizer:
                 return
             if self.require_format and not PLATE_RE.match(text):
                 return
+            self._read_version[key] = self._read_version.get(key, 0) + 1
             # --- Step 1: weighted accumulate + vote ---
             weight = max(0.05, float(confidence)) * max(1.0, float(plate_width))
             self._reads.setdefault(key, []).append((text, weight, float(confidence)))
@@ -85,6 +88,7 @@ class OcrStabilizer:
                 if float(confidence) >= self._confirmed_confidence.get(key, -1.0):
                     self._confirmed[key] = text
                     self._confirmed_confidence[key] = float(confidence)
+                    self._confirmed_version[key] = self._read_version[key]
                 return
             voted = self._vote(self._reads[key])
             if voted:
@@ -93,6 +97,7 @@ class OcrStabilizer:
                     (score for value, _weight, score in self._reads[key] if value == voted),
                     default=float(confidence),
                 )
+                self._confirmed_version[key] = self._read_version[key]
 
     def _vote(self, reads: List[Tuple[str, float, float]]) -> str:
         if len(reads) < self.confirm_min_reads:
@@ -127,6 +132,20 @@ class OcrStabilizer:
         with self._lock:
             return self._confirmed_confidence.get((camera, int(track_id)))
 
+    def confirmed_version(self, camera: str, track_id: int) -> Optional[int]:
+        """Monotonic accepted OCR-result version for event-side de-duplication."""
+        with self._lock:
+            return self._confirmed_version.get((camera, int(track_id)))
+
+    def confirmed_support(self, camera: str, track_id: int) -> int:
+        key = (camera, int(track_id))
+        with self._lock:
+            text = self._confirmed.get(key)
+            if not text:
+                return 0
+            return sum(1 for value, _weight, _confidence in self._reads.get(key, [])
+                       if value == text)
+
     def text_for(self, camera: str, track_id: int) -> Optional[str]:
         key = (camera, int(track_id))
         with self._lock:
@@ -155,6 +174,8 @@ class OcrStabilizer:
                 self._reads.pop(k, None)
                 self._confirmed.pop(k, None)
                 self._confirmed_confidence.pop(k, None)
+                self._confirmed_version.pop(k, None)
+                self._read_version.pop(k, None)
                 self._provisional.pop(k, None)
                 self._last_frame.pop(k, None)
                 self._attempts.pop(k, None)

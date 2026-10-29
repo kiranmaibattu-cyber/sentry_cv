@@ -1,11 +1,11 @@
 contract: sentry-v6
 schema_version: "6.0"
 wire_schema_version: "6.0"
-status: published-development
-image: ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25
-registry_digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
-local_digest: sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3
-image_id: cb5ec20698878feec22ac108902c5ab344e2b3af78e665658a2a298c49dab132
+status: built-development
+image: ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.30-v6-dev39
+registry_digest: sha256:aae3a9ed26a83b9e93958b74dcd02dde7a232ff85d1301f99014243dda9b0a29
+local_digest: sha256:aae3a9ed26a83b9e93958b74dcd02dde7a232ff85d1301f99014243dda9b0a29
+image_id: d43d03ad200391a80f7f5038aca5fe0fed4481d2805bef8f610896b2e64a0cf6
 architecture: amd64
 hardware_profile: intel-285h
 changes:
@@ -35,8 +35,41 @@ changes:
   - canonical_desired_state_example_embedded_in_the_image
   - removed_inactive_v4_scene_and_person_reid_publishers
   - optional_operator_analytics_uses_an_internal_format_namespace
+  - per_camera_mmap_vehicle_input_slots_replace_manager_pixel_serialization
+  - fair_round_robin_batch_one_vehicle_scheduler_with_four_async_gpu_requests
+  - camera_local_tracking_policy_evidence_and_delivery_remain_unchanged
+  - scheduler_queue_wait_and_device_inference_latency_in_camera_health
+  - bounded_per_camera_job_queues_and_restart_safe_job_correlation
+  - shared_slot_capacity_check_with_safe_tmp_fallback_for_50_cameras
+  - nonblocking_async_queue_admission_prevents_completion_callback_starvation
+  - shared_inference_timeout_skips_one_frame_without_restarting_camera_lifecycle
+  - bounded_adaptive_per_camera_subsystem_policy_with_hysteresis
+  - adaptive_time_based_tracker_and_presence_recovery_windows
+  - ambiguity_aware_local_presence_reassociation
+  - positive_zone_transition_votes_and_hold_time
+  - count_debounce_and_twenty_second_freshness_heartbeat
+  - anpr_distinct_observation_best_candidate_and_unreadable_outcome
+  - spatially_consistent_temporally_confirmed_hazard_emission
+  - resolved_policy_and_timestamp_source_in_camera_health
+  - count_only_bindings_do_not_emit_presence_lifecycle_traffic
+  - hazard_clear_requires_continuous_evaluated_negative_sequence
+  - frame_relative_person_and_vehicle_adaptive_gate_measurements
+  - face_pose_size_quality_and_anpr_stability_adaptive_inputs
+  - actual_recovery_based_fragmentation_and_recent_expectation_dropout
+  - bounded_pressure_aware_optional_scene_sampling
+  - fire_smoke_model_moved_to_explicit_npu_without_cpu_or_auto_fallback
+  - fire_smoke_health_reports_actual_openvino_execution_device
+  - bounded_single_thread_ffmpeg_filter_and_opencv_pools_per_camera
+  - truthful_edge_receive_timestamp_provenance_when_source_pts_is_unavailable
+  - exact_parent_runtime_tag_and_image_id_in_oci_metadata
+  - geometry_only_hot_reload_preserves_worker_stream_session_and_presence_ids
+  - geometry_change_closes_affected_episodes_unknown_without_fake_entry_or_exit
+  - motion_quiet_frames_do_not_age_presence_lifecycle
+  - tracker_retained_predictions_preserve_association_without_refreshing_observation
+  - small_subject_presence_recovery_hysteresis_is_bounded_at_ten_seconds
+  - live_face_line_crossing_and_fire_smoke_trigger_qualification
 validation:
-  runtime_tests: 65
+  runtime_tests: 78
   schemas: 5
   event_examples: 16
   accepted_camera_configuration_counts: [1, 8, 16, 50]
@@ -57,12 +90,125 @@ validation:
     failed_camera_state: unavailable
     readiness_http_status: 200
   delivery_http_exchange_test: observation_then_evidence_then_embedding_acknowledged
+  dev27_live_thirteen_camera:
+    sources: three_rtsps_plus_ten_mpeg_ts_tcp
+    target_fps: 5
+    healthy_cameras: 13
+    fresh_cameras: 13
+    cameras_with_completed_inference: 13
+    schema_valid_outbox_packages_at_capture: 464
+    shared_inference_timeouts: 0
+    gpu_resource_rejections: 0
+    camera_process_failures: 0
+    scheduler_failures: 0
+  dev28_adaptive_policy_live_validation:
+    thirteen_camera_sources: three_rtsps_plus_ten_mpeg_ts_tcp
+    thirteen_camera_healthy: 13
+    target_and_observed_decoded_fps: approximately_5
+    resolved_modes_observed: [strict, balanced, tolerant_collection]
+    count_only_presence_lifecycle_events: 0
+    full_app_vehicle_heavy_packages: 142
+    full_app_evidence_assets: 86
+    full_app_embeddings: 28
+    broken_event_evidence_embedding_references: 0
+    embedding_dimensions_observed: [384, 768, 4096]
+    plate_outcomes_observed: true
+    gated_plate_reads_observed: 2
+    plate_ground_truth_certified: false
+    fire_smoke_false_positive_events_observed: 0
+  dev29_final_image_smoke:
+    source: tcp_mpeg_ts_h264_1920x1080
+    health: healthy
+    decoded_fps: 4.82
+    inference_fps: 4.82
+    hazard_clear_confirmations: 5
+    hazard_clear_seconds: 10
+    hazard_clear_max_evaluation_gap_seconds: 2.5
+    warnings_or_errors: 0
+  dev31_complete_adaptive_policy_live_validation:
+    source: tcp_mpeg_ts_h264_1920x1080
+    health: healthy
+    target_fps: 5
+    decoded_fps: 5.026
+    inference_fps: 5.026
+    resolved_policy_schema: "1.1"
+    person_profile: tolerant_collection
+    vehicle_profile: balanced
+    detection_dropout_ratio: 0.0
+    recovered_fragmentations_last_60s: 0
+    outbox_packages_at_capture: 55
+    broken_event_evidence_embedding_references: 0
+    warnings_or_errors: 0
+  dev32_fire_smoke_npu_mixed_sixteen_camera:
+    target_fps: 8
+    healthy_cameras: 16
+    decoded_fps_mean: 7.975
+    decoded_fps_minimum: 7.756
+    fire_smoke_execution_device: NPU
+    fire_smoke_inference_lifetime_average_ms: 14.74
+    inference_timeouts: 0
+    accelerator_resource_rejections: 0
+    decoder_restarts: 0
+    fire_smoke_inference_skips: 0
+  dev33_mixed_all_scene_capacity:
+    target_fps: 8
+    validated_camera_count: 23
+    decoded_fps_mean: 8.093
+    decoded_fps_minimum: 7.069
+    healthy_cameras: 23
+    container_memory_gib: 10.5
+    container_pids: 1332
+    gpu_resource_rejections: 0
+    shared_inference_timeouts: 0
+    decoder_reconnects: 0
+    next_count_tested: 24
+    next_count_result: failed_gpu_resource_pressure
+  dev39_issue_1_to_5_qualification:
+    timestamp_source_without_camera_pts: edge_received_at
+    parent_base: localhost/apexfabric-intel-traffic-runtime-base:intel-285h-2026.09.18-v2
+    parent_base_image_id: 1a7a4208cefe3567d03e9d2222a7711530b359861a579d936fb079af50f76c6d
+    geometry_hot_reload_preserved_worker_and_session: true
+    geometry_hot_reload_synthetic_entry_or_exit: false
+    motion_quiet_frames_age_presence: false
+    tracker_predictions_refresh_real_observation: false
+    small_subject_unobserved_cap_seconds: 10
+    live_presence_rtsps:
+      target_fps: 8
+      decoded_fps: 7.954
+      hardware_decode: GPU_VAAPI
+      vehicle_person_detection: GPU
+      timestamp_source: edge_received_at
+      subsecond_loss_recovery_pairs: 0
+      minimum_observed_recovery_delay_seconds: approximately_5
+      schema_valid_observations: 21
+      evidence_assets: 6
+      broken_references: 0
+      healthz_http_status: 200
+      readyz_http_status: 200
+      metrics_http_status: 200
+      healthy_alias_http_status: 404
+    live_face_samples_observed: true
+    live_line_crossing_observed: true
+    live_fire_smoke_suspected_observed: true
+    package_schema_validation:
+      observations: 478
+      evidence: 403
+      embeddings: 79
+      broken_references: 0
+    plate_ground_truth_certified: false
+    plate_ground_truth_note: supplied_motorcycle_sample_did_not_exact_match_visible_text
+  dev26_recorded_video_baseline:
+    source: Camera12_1920x1080_h264_over_local_http
+    hardware_decode: VAAPI
+    one_camera_full_app: healthy_with_v6_scene_evidence_and_embedding
+    five_camera_same_source: all_cameras_received_shared_scheduler_results
+    scheduler: fair_round_robin_batch_one_four_async_requests
+    gpu_resource_rejections: 0
+    camera_process_failures: 0
+    scheduler_failures: 0
+    note: decoded_fps_is_not_a_capacity_result_because_http_served_the_file_faster_than_realtime
 known_issues:
   - 50_camera_configuration_limit_is_not_a_50_camera_full_app_throughput_claim
   - higher_camera_count_memory_and_fps_require_workload_specific_intel_qualification
-  - tested_view_showed_repeated_person_loss_recovery_transitions
-untested_live_triggers:
-  - anpr
-  - line_crossing
-  - fire_smoke_transition
-  - qualifying_face_sample
+  - lifecycle_transitions_still_require_visual_ground_truth_for_precision_measurement
+  - supplied_motorcycle_plate_sample_failed_exact_ocr_ground_truth_match

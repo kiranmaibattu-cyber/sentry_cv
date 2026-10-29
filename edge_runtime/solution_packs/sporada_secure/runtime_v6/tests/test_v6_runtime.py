@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import logging
+import multiprocessing as mp
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,7 @@ sys.path.insert(0, str(ROOT / "services" / "worker"))
 
 from pipeline import v6_events
 from pipeline.v6_events import V6EventPipeline
+from pipeline.adaptive_policy import AdaptivePolicyResolver
 from pipeline.motion_gate import MotionGateController
 from pipeline.surface_stream import SurfaceSwitch
 from pipeline.ocr_stabilizer import OcrStabilizer
@@ -30,6 +32,11 @@ from pipeline.runtime_telemetry import CameraTelemetry
 from pipeline.runtime_status import DecoderRuntimeStatus
 from pipeline.structured_logging import JsonLogFormatter, set_log_context
 from pipeline.resource_metrics import AcceleratorSampler, CgroupSampler
+from pipeline.shared_vehicle_inference import (
+    VehicleInputSlot,
+    create_vehicle_channels,
+    destroy_vehicle_channels,
+)
 from detectors.backends.openvino_ocr_async import AsyncOCR
 from detectors.backends.openvino_smoke_fire import _device_with_fallback
 from detectors.backends.openvino_face import OpenVINOFaceExtractor, _pose_quality, _rotation_to_euler
@@ -105,6 +112,9 @@ def test_gpu_resource_error_classifier_is_narrow():
         "[GPU] clFinish, error code: -5 CL_OUT_OF_RESOURCES"
     ))
     assert is_transient_gpu_resource_error(RuntimeError("error code: -5"))
+    assert is_transient_gpu_resource_error(RuntimeError(
+        "shared vehicle inference timed out for camera-a"
+    ))
     assert not is_transient_gpu_resource_error(RuntimeError("model input shape mismatch"))
 
 
@@ -117,20 +127,20 @@ def test_detector_request_reset_discards_only_the_current_thread_request():
 
 
 def test_shared_vehicle_detector_client_preserves_source_coordinates():
-    class Service:
-        def execution_devices(self):
-            return "GPU.0"
-
+    class Transport:
         def infer(self, canvas):
             assert canvas.shape == (640, 640, 3)
             output = np.zeros((1, 2, 6), np.float32)
             output[0, 0] = [32, 192, 320, 480, 0.9, 1]
             return {"output": output, "error": None}
 
-        def reset_request(self):
+        def reset(self):
             return None
 
-    detector = SharedVehicleDetectorClient(Service(), confidence=0.3)
+    detector = SharedVehicleDetectorClient.__new__(SharedVehicleDetectorClient)
+    detector._transport = Transport()
+    detector.confidence = 0.3
+    detector.exec_devices = "GPU.0"
     detections = detector.detect(np.zeros((100, 200, 3), np.uint8))
     assert len(detections) == 1
     assert detections[0].class_name == "car"
@@ -138,16 +148,45 @@ def test_shared_vehicle_detector_client_preserves_source_coordinates():
 
 
 def test_shared_vehicle_detector_client_propagates_gpu_failure():
-    class Service:
-        def execution_devices(self):
-            return "GPU.0"
-
+    class Transport:
         def infer(self, _canvas):
             return {"output": None, "error": "CL_OUT_OF_RESOURCES"}
 
-    detector = SharedVehicleDetectorClient(Service(), confidence=0.3)
+    detector = SharedVehicleDetectorClient.__new__(SharedVehicleDetectorClient)
+    detector._transport = Transport()
+    detector.confidence = 0.3
+    detector.exec_devices = "GPU.0"
     with pytest.raises(RuntimeError, match="CL_OUT_OF_RESOURCES"):
         detector.detect(np.zeros((100, 200, 3), np.uint8))
+
+
+def test_shared_vehicle_input_slot_preserves_exact_canvas(tmp_path):
+    path = tmp_path / "vehicle-slot.bgr"
+    owner = VehicleInputSlot(str(path), width=8, height=6, create=True)
+    reader = VehicleInputSlot(str(path), width=8, height=6, create=False)
+    try:
+        canvas = np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3)
+        owner.write(canvas)
+        assert np.array_equal(reader.array, canvas)
+    finally:
+        reader.close()
+        owner.close()
+
+
+def test_shared_vehicle_channels_are_bounded_and_camera_private(tmp_path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_SHARED_MEMORY_DIR", str(tmp_path))
+    channels, owners = create_vehicle_channels(
+        mp.get_context("spawn"), ["cam-a", "cam-b"], owner_pid=1234
+    )
+    try:
+        assert set(channels) == {"cam-a", "cam-b"}
+        assert channels["cam-a"].slot_path != channels["cam-b"].slot_path
+        assert Path(channels["cam-a"].slot_path).stat().st_size == 640 * 640 * 3
+        assert channels["cam-a"].request_queue._maxsize == 1
+        assert channels["cam-a"].response_queue._maxsize == 2
+    finally:
+        destroy_vehicle_channels(channels, owners)
+    assert not list(tmp_path.glob("*.bgr"))
 
 
 def test_camera_runtime_telemetry_reports_rates_latency_outputs_and_resources(
@@ -304,16 +343,34 @@ def test_one_failed_camera_does_not_block_healthy_peer_or_readiness(
     assert cameras["cam-failed"]["camera_health"]["state"] == "unavailable"
 
 
-def packet(index, boxes=(), plate=None):
+def packet(index, boxes=(), plate=None, *, width=100, height=100):
     detections = [SimpleNamespace(model_name="vehicle", class_name=kind,
                                   bbox=box, confidence=.9,
                                   metadata={"track_id": track})
                   for kind, track, box in boxes]
+    frame = np.full((height, width, 3), 128, np.uint8)
     if plate is not None:
-        detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
+        plate_box = (30, 50, 60, 62)
+        pattern = (np.indices((12, 30)).sum(axis=0) % 2 * 255).astype(np.uint8)
+        frame[50:62, 30:60] = np.repeat(pattern[:, :, None], 3, axis=2)
+        detections.append(SimpleNamespace(model_name="license_plate", bbox=plate_box,
                                           confidence=.9, metadata={"ocr_text": plate}, parent_id=1))
-    return SimpleNamespace(index=index, frame=np.full((100, 100, 3), 128, np.uint8),
+    return SimpleNamespace(index=index, frame=frame,
                            detections=detections)
+
+
+def add_quality_plate(sample, text, confidence, *, parent_id=1, provisional=None):
+    box = (30, 48, 62, 60)
+    pattern = (np.indices((12, 32)).sum(axis=0) % 2 * 255).astype(np.uint8)
+    sample.frame[48:60, 30:62] = np.repeat(pattern[:, :, None], 3, axis=2)
+    metadata = {"ocr_text": text, "ocr_confidence": confidence}
+    if provisional is not None:
+        metadata["ocr_provisional"] = provisional
+    sample.detections.append(SimpleNamespace(
+        model_name="license_plate", bbox=box, confidence=.9,
+        metadata=metadata, parent_id=parent_id,
+    ))
+    return sample
 
 
 def binding(use_case_id, app, scope="full_frame", ids=(), kind="vehicle", **extra):
@@ -660,7 +717,110 @@ def test_surface_switch_starts_active_then_releases():
     assert not switch.tracking
 
 
-def test_quiet_frame_advances_lifecycle_without_negative_facts(tmp_path, monkeypatch):
+def test_adaptive_policy_uses_bounded_hysteresis_for_distant_camera():
+    resolver = AdaptivePolicyResolver("cam", target_fps=5)
+    frame = np.full((1080, 1920, 3), 128, np.uint8)
+    tiny = SimpleNamespace(
+        model_name="vehicle", bbox=(100, 100, 145, 125), metadata={},
+    )
+    assert not resolver.observe_frame(frame, [tiny], 100.0)
+    assert not resolver.observe_frame(frame, [tiny], 105.1)
+    assert resolver.section("presence")["mode"] == "balanced"
+    assert resolver.observe_frame(frame, [tiny], 110.2)
+    assert resolver.section("presence")["mode"] == "tolerant_collection"
+    assert resolver.section("presence")["ended_unknown_after_seconds"] == 20.0
+    assert resolver.section("anpr")["ocr_emit_min_confidence"] >= .35
+    snapshot = resolver.snapshot()
+    assert snapshot["bounded_adaptation"] is True
+    assert snapshot["measurements"]["median_object_scale"] > 0
+
+
+def test_adaptive_policy_resolves_person_and_vehicle_geometry_independently():
+    resolver = AdaptivePolicyResolver("cam", target_fps=5)
+    frame = np.full((1000, 1000, 3), 128, np.uint8)
+    person = SimpleNamespace(
+        model_name="vehicle", class_name="pedestrian",
+        bbox=(100, 100, 400, 700), metadata={},
+    )
+    distant_vehicle = SimpleNamespace(
+        model_name="vehicle", class_name="car",
+        bbox=(800, 800, 820, 820), metadata={},
+    )
+    resolver.observe_frame(frame, [person, distant_vehicle], 100.0)
+    resolver.observe_frame(frame, [person, distant_vehicle], 105.1)
+    resolver.observe_frame(frame, [person, distant_vehicle], 110.2)
+    assert resolver.section("presence", "person")["mode"] == "strict"
+    assert resolver.section("presence", "vehicle")["mode"] == "tolerant_collection"
+    snapshot = resolver.snapshot()
+    assert snapshot["measurements"]["median_person_scale"] > .18
+    assert snapshot["measurements"]["median_vehicle_scale"] < .075
+
+
+def test_adaptive_policy_uses_dropout_plate_face_and_pressure_measurements():
+    resolver = AdaptivePolicyResolver("cam", target_fps=5)
+    frame = np.full((1080, 1920, 3), 128, np.uint8)
+    vehicle = SimpleNamespace(
+        model_name="vehicle", class_name="car",
+        bbox=(100, 100, 400, 400), metadata={},
+    )
+    face = SimpleNamespace(
+        bbox=(10, 10, 40, 45), quality=.35, pose_quality=.40,
+    )
+    for index, now in enumerate((100.0, 105.1, 110.2)):
+        resolver.observe_plate(
+            width=18, height=5, frame_width=1920, sharpness=4,
+            ocr_confidence=.30, text=f"NOISY{index}",
+        )
+        resolver.observe_anpr_outcome(False)
+        resolver.observe_face(face, frame.shape)
+        resolver.observe_face_pipeline({
+            "evaluated": True, "due_tracks": 4, "detected_faces": 1,
+        })
+        resolver.observe_frame(
+            frame, [vehicle], now,
+            tracker_observation={
+                "detector_evaluated": True, "active_tracks": 4,
+                "matched_tracks": 1,
+            },
+            model_queue_wait_seconds=.12,
+        )
+    resolver.observe_pressure(
+        outbox_pending_bytes=600, outbox_limit_bytes=1000,
+        model_queue_wait_seconds=.12,
+    )
+    assert resolver.section("presence")["mode"] == "tolerant_collection"
+    assert resolver.section("anpr")["mode"] == "tolerant_collection"
+    assert resolver.section("identity")["mode"] == "tolerant_collection"
+    snapshot = resolver.snapshot()
+    assert snapshot["measurements"]["real_detection_dropout_ratio"] == .75
+    assert snapshot["measurements"]["median_plate_height_px"] == 5
+    assert snapshot["measurements"]["ocr_text_stability_ratio"] < .5
+    assert snapshot["measurements"]["face_detection_success_ratio"] == .25
+    assert snapshot["pressure"]["mode"] == "elevated"
+    assert snapshot["scene"]["pressure_interval_multiplier"] == 2
+
+
+def test_count_only_binding_does_not_emit_presence_lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v6_events, "time", clock)
+    pipeline = V6EventPipeline(
+        "cam", config([binding("count", "vehicle_counting")]),
+    )
+    for index in range(5):
+        pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
+        clock.value += .2
+    clock.value += 20
+    pipeline.process(packet(6))
+    output = events(tmp_path)
+    assert any(item["event_type"] == "zone_count" for item in output)
+    assert not any(item["event_type"] in {
+        "object_present", "track_lost", "presence_recovered",
+        "presence_ended_unknown",
+    } for item in output)
+
+
+def test_quiet_frame_preserves_lifecycle_without_negative_facts(tmp_path, monkeypatch):
     monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
     clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
     monkeypatch.setattr(v6_events, "time", clock)
@@ -678,13 +838,13 @@ def test_quiet_frame_advances_lifecycle_without_negative_facts(tmp_path, monkeyp
     before = events(tmp_path)
     zero_counts_before = len([item for item in before
                               if item["event_type"] == "zone_count" and item["count"] == 0])
-    clock.value += 2.1
+    clock.value += 5.1
     pipeline.process_quiet(clock.value, 4)
-    clock.value += 8
+    clock.value += 13
     pipeline.process_quiet(clock.value, 5)
     output = events(tmp_path)
-    assert any(item["event_type"] == "track_lost" for item in output)
-    assert any(item["event_type"] == "presence_ended_unknown" for item in output)
+    assert not any(item["event_type"] == "track_lost" for item in output)
+    assert not any(item["event_type"] == "presence_ended_unknown" for item in output)
     assert not any(item["event_type"] == "zone_exit" for item in output)
     assert not any(item["event_type"] == "fire_smoke_cleared" for item in output)
     zero_counts_after = len([item for item in output
@@ -733,14 +893,14 @@ def test_loss_is_unknown_and_positive_exit_is_separate(tmp_path, monkeypatch):
     for index in range(3):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
         clock.value += .1
-    for index in range(3, 5):
+    for index in range(3, 6):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 95))]))
-        clock.value += .1
+        clock.value += .3
     assert len([item for item in events(tmp_path) if item["event_type"] == "zone_exit"]) == 1
-    clock.value += 2.1
-    pipeline.process(packet(5))
-    clock.value += 8
+    clock.value += 5.1
     pipeline.process(packet(6))
+    clock.value += 13
+    pipeline.process(packet(7))
     output = events(tmp_path)
     assert len([item for item in output if item["event_type"] == "track_lost"]) == 1
     assert len([item for item in output if item["event_type"] == "presence_ended_unknown"]) == 1
@@ -778,6 +938,7 @@ def test_frame_receive_time_is_used_for_observations(tmp_path, monkeypatch):
         pipeline.process(item)
     present = next(item for item in events(tmp_path) if item["event_type"] == "object_present")
     assert present["observed_at"] == "1970-01-01T00:01:40.200000Z"
+    assert pipeline.timestamp_source == "edge_received_at"
 
 
 def test_frame_observed_time_precedes_receive_time_when_available(tmp_path, monkeypatch):
@@ -790,6 +951,7 @@ def test_frame_observed_time_precedes_receive_time_when_available(tmp_path, monk
         pipeline.process(item)
     present = next(item for item in events(tmp_path) if item["event_type"] == "object_present")
     assert present["observed_at"] == "1970-01-01T00:01:30.200000Z"
+    assert pipeline.timestamp_source == "source_pts"
 
 
 def test_same_track_recovery_is_explicit(tmp_path, monkeypatch):
@@ -801,14 +963,96 @@ def test_same_track_recovery_is_explicit(tmp_path, monkeypatch):
     for index in range(3):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
         clock.value += .1
-    clock.value += 2.1
+    clock.value += 5.1
     pipeline.process(packet(3))
-    pipeline.process(packet(4, [("car", 1, (20, 20, 70, 75))]))
+    clock.value += 5.1
+    pipeline.process(packet(4))
+    pipeline.process(packet(5, [("car", 1, (20, 20, 70, 75))]))
     output = events(tmp_path)
     recovered = [item for item in output if item["event_type"] == "presence_recovered"]
     assert len(recovered) == 1
     assert recovered[0]["previous_track_id"] == recovered[0]["track_id"] == "1"
     assert recovered[0]["zone_episodes"][0]["observation_state"] == "observed_inside"
+
+
+def test_motion_quiet_frames_do_not_age_presence_lifecycle(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v6_events, "time", clock)
+    pipeline = V6EventPipeline(
+        "cam", config([binding("presence", "person_presence", kind="person")])
+    )
+    for index in range(3):
+        pipeline.process(packet(index, [("pedestrian", 1, (20, 10, 80, 90))]))
+        clock.value += .1
+    presence_id = next(
+        item["presence_id"] for item in events(tmp_path)
+        if item["event_type"] == "object_present"
+    )
+
+    for index in range(3, 100):
+        clock.value += .25
+        pipeline.process_quiet(clock.value, index)
+
+    output = events(tmp_path)
+    assert not any(
+        item["event_type"] in {
+            "track_lost", "presence_recovered", "presence_ended_unknown",
+        }
+        for item in output
+    )
+    assert presence_id in pipeline.presences
+
+
+def test_tracker_retained_prediction_suppresses_external_track_loss(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v6_events, "time", clock)
+    pipeline = V6EventPipeline(
+        "cam", config([binding("presence", "person_presence", kind="person")])
+    )
+    for index in range(3):
+        pipeline.process(packet(index, [("pedestrian", 1, (20, 10, 80, 90))]))
+        clock.value += .1
+
+    for index in range(3, 8):
+        clock.value += 2
+        sample = packet(index, [("pedestrian", 1, (20, 10, 80, 90))])
+        sample.detections[0].metadata["predicted"] = True
+        pipeline.process(sample)
+
+    output = events(tmp_path)
+    assert not any(
+        item["event_type"] in {"track_lost", "presence_recovered"}
+        for item in output
+    )
+
+
+def test_small_subject_gets_extended_recovery_hysteresis(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v6_events, "time", clock)
+    pipeline = V6EventPipeline(
+        "cam", config([binding("presence", "person_presence", kind="person")])
+    )
+    # 32x102 in a 1280x720 source represents the distant people observed in
+    # the live qualification view.
+    for index in range(3):
+        pipeline.process(packet(
+            index, [("pedestrian", 1, (256, 55, 288, 157))],
+            width=1280, height=720,
+        ))
+        clock.value += .1
+
+    clock.value += .1
+    pipeline.process(packet(3, width=1280, height=720))
+    clock.value += 8.1
+    pipeline.process(packet(4, width=1280, height=720))
+    assert not any(item["event_type"] == "track_lost" for item in events(tmp_path))
+
+    clock.value += 2.1
+    pipeline.process(packet(5, width=1280, height=720))
+    assert any(item["event_type"] == "track_lost" for item in events(tmp_path))
 
 
 def test_stream_disconnect_has_unknown_not_exit_and_new_session(tmp_path, monkeypatch):
@@ -867,16 +1111,98 @@ def test_binding_revision_does_not_require_worker_restart():
     assert _hot_reload_signature(desired(1, "a")) == _hot_reload_signature(desired(2, "b"))
 
 
+def test_geometry_revision_does_not_require_worker_restart():
+    def desired(revision, polygon):
+        camera = SimpleNamespace(
+            camera_id="cam", name="cam", source="file:/x", fps=8.0,
+            apps=("v6_events",),
+            config={"v6": {
+                "geometry": {"zones": [{"id": "parking", "poly": polygon}]},
+                "bindings": [binding(
+                    "presence", "vehicle_presence", "geometry", ["parking"]
+                )],
+            }},
+        )
+        return SimpleNamespace(
+            edge_id="edge", deployment_id="dep", revision=revision,
+            cameras=[camera],
+        )
+
+    old = [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]
+    new = [[.0, .0], [.4, .0], [.4, .4], [.0, .4]]
+    assert _hot_reload_signature(desired(1, old)) == _hot_reload_signature(desired(2, new))
+
+
+def test_geometry_revision_preserves_presence_without_false_exit(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v6_events, "time", clock)
+    old_zone = {
+        "id": "parking", "name": "Parking",
+        "poly": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]],
+    }
+    presence = binding(
+        "presence", "vehicle_presence", "geometry", ["parking"]
+    )
+    pipeline = V6EventPipeline("cam", config([presence], [old_zone]))
+    for index in range(3):
+        pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
+        clock.value += .1
+    first = next(
+        item for item in events(tmp_path)
+        if item["event_type"] == "object_present"
+    )
+    session = pipeline.session_id
+
+    new_zone = {
+        "id": "parking", "name": "Parking",
+        "poly": [[.0, .0], [.4, .0], [.4, .4], [.0, .4]],
+    }
+    updated = config([presence], [new_zone])
+    updated["analytics"]["v6_events"]["v6"]["config_revision"] = 2
+    pipeline.reconfigure(updated)
+
+    output = events(tmp_path)
+    material = next(
+        item for item in output
+        if item["event_type"] == "object_present"
+        and item["reason"] == "material_change"
+    )
+    assert pipeline.session_id == session
+    assert material["presence_id"] == first["presence_id"]
+    assert material["zone_episodes"][0]["observation_state"] == "ended_unknown"
+    assert not any(item["event_type"] == "zone_exit" for item in output)
+    assert any(
+        item["event_type"] == "camera_health"
+        and item["reason"] == "view_changed"
+        for item in output
+    )
+
+    for index in range(3, 7):
+        clock.value += .1
+        pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
+    output = events(tmp_path)
+    assert not any(
+        item["event_type"] in {"zone_entry", "zone_exit"}
+        and item["config_revision"] == 2
+        for item in output
+    )
+
+
 def test_shared_polygon_fans_out_with_one_episode(tmp_path, monkeypatch):
     monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
+    clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
+    monkeypatch.setattr(v6_events, "time", clock)
     zone = {"id": "parking", "name": "Parking", "poly": [[.1, .1], [.9, .1], [.9, .9], [.1, .9]]}
     bindings = [binding("a", "vehicle_presence", "geometry", ["parking"]),
                 binding("b", "vehicle_presence", "geometry", ["parking"])]
     pipeline = V6EventPipeline("cam", config(bindings, [zone]))
     for index in range(3):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 95))]))
-    for index in range(3, 5):
+        clock.value += .1
+    for index in range(3, 6):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
+        clock.value += .3
     output = events(tmp_path)
     entrances = [item for item in output if item["event_type"] == "zone_entry"]
     assert {item["use_case_id"] for item in entrances} == {"a", "b"}
@@ -1053,21 +1379,25 @@ def test_fire_episode_has_clear_transition(tmp_path, monkeypatch):
     clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
     monkeypatch.setattr(v6_events, "time", clock)
     pipeline = V6EventPipeline("cam", config([binding("hazard", "fire_smoke", kind=None)]))
-    for index in range(3):
+    for index in range(5):
         sample = packet(index)
         sample.detections.append(SimpleNamespace(model_name="smoke_fire", class_name="fire",
                                                  bbox=(20, 20, 60, 60), confidence=.9))
         pipeline.process(sample)
         clock.value += .5
-    first_negative = packet(3)
+    first_negative = packet(5)
     pipeline.process(first_negative)
     clock.value += 9
-    skipped = packet(4)
+    skipped = packet(6)
     skipped.analytics_state = {"fire_smoke_evaluated": False}
     pipeline.process(skipped)
     assert not any(item["event_type"] == "fire_smoke_cleared" for item in events(tmp_path))
     clock.value += 2
-    pipeline.process(packet(5))
+    pipeline.process(packet(7))
+    assert not any(item["event_type"] == "fire_smoke_cleared" for item in events(tmp_path))
+    for index in range(8, 18):
+        clock.value += 1
+        pipeline.process(packet(index))
     output = events(tmp_path)
     suspected = next(item for item in output if item["event_type"] == "fire_smoke_suspected")
     cleared = next(item for item in output if item["event_type"] == "fire_smoke_cleared")
@@ -1101,6 +1431,20 @@ def test_v6_accelerators_fail_closed(monkeypatch):
         decode._ffmpeg_cmd("rtsp://example.invalid/live", 8, True)
 
 
+def test_vaapi_decoder_uses_bounded_per_camera_cpu_thread_pools():
+    command = decode._ffmpeg_cmd("tcp://127.0.0.1:9001", 8, True)
+    assert command[command.index("-threads") + 1] == "1"
+    assert command[command.index("-filter_threads") + 1] == "1"
+    assert command[command.index("-filter_complex_threads") + 1] == "1"
+
+
+def test_fire_smoke_defaults_to_npu_without_cpu_fallback():
+    core = SimpleNamespace(available_devices=["CPU", "NPU.3720"])
+    assert _device_with_fallback(core, "NPU") == "NPU"
+    worker_config = json.loads((ROOT / "config" / "worker.json").read_text())
+    assert worker_config["models"]["smoke_fire"]["device"] == "NPU"
+
+
 def test_plate_attempt_has_one_failure_outcome_and_later_correction(tmp_path, monkeypatch):
     monkeypatch.setenv("APEXFABRIC_STATE_ROOT", str(tmp_path))
     clock = SimpleNamespace(value=100.0, time=lambda: clock.value)
@@ -1120,26 +1464,25 @@ def test_plate_attempt_has_one_failure_outcome_and_later_correction(tmp_path, mo
         record = json.loads(next(path for path in (tmp_path / "sentinel_v6" / "outbox" / "cam").glob("*.json")
                                  if json.loads(path.read_text())["observation"]["observation_id"] == outcome["observation_id"]).read_text())
         assert record["evidence"][0]["metadata"]["evidence_type"] == "frame"
-    first_read = packet(5, [("car", 1, (20, 20, 70, 75))])
-    first_read.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                                 confidence=.8,
-                                                 metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .35},
-                                                 parent_id=1))
+    first_read = add_quality_plate(
+        packet(5, [("car", 1, (20, 20, 70, 75))]), "KA01AB1234", .35,
+    )
     pipeline.process(first_read)
     clock.value += .1
-    selected_read = packet(6, [("car", 1, (20, 20, 70, 75))])
-    selected_read.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                                    confidence=.8,
-                                                    metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .80},
-                                                    parent_id=1))
+    selected_read = add_quality_plate(
+        packet(6, [("car", 1, (20, 20, 70, 75))]), "KA01AB1234", .80,
+    )
     pipeline.process(selected_read)
-    clock.value += 6
-    corrected_read = packet(7, [("car", 1, (20, 20, 70, 75))])
-    corrected_read.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                                     confidence=.8,
-                                                     metadata={"ocr_text": "KA01AB1235", "ocr_confidence": .95},
-                                                     parent_id=1))
-    pipeline.process(corrected_read)
+    clock.value += 2.6
+    pipeline.process(packet(7, [("car", 1, (20, 20, 70, 75))]))
+    clock.value += 5.1
+    pipeline.process(add_quality_plate(
+        packet(8, [("car", 1, (20, 20, 70, 75))]), "KA01AB1235", .95,
+    ))
+    clock.value += .1
+    pipeline.process(add_quality_plate(
+        packet(9, [("car", 1, (20, 20, 70, 75))]), "KA01AB1235", .95,
+    ))
     reads = [item for item in events(tmp_path) if item["event_type"] == "plate_read"]
     assert len(reads) == 4
     by_binding = {key: [item for item in reads if item["use_case_id"] == key]
@@ -1171,24 +1514,28 @@ def test_anpr_improved_confidence_supersedes_same_plate(tmp_path, monkeypatch):
     pipeline = V6EventPipeline("cam", config([binding("plate", "anpr")]))
     for index in range(3):
         pipeline.process(packet(index, [("car", 1, (20, 20, 70, 75))]))
-    low = packet(3, [("car", 1, (20, 20, 70, 75))])
-    low.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                          confidence=.8,
-                                          metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .30},
-                                          parent_id=1))
-    high = packet(4, [("car", 1, (20, 20, 70, 75))])
-    high.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                           confidence=.8,
-                                           metadata={"ocr_text": "KA01AB1234", "ocr_confidence": .45},
-                                           parent_id=1))
-    pipeline.process(low)
-    clock.value += 2.1
-    pipeline.process(low)
-    clock.value += 6
-    pipeline.process(high)
+    pipeline.process(add_quality_plate(
+        packet(3, [("car", 1, (20, 20, 70, 75))]), "KA01AB1234", .50,
+    ))
+    clock.value += .1
+    pipeline.process(add_quality_plate(
+        packet(4, [("car", 1, (20, 20, 70, 75))]), "KA01AB1234", .50,
+    ))
+    clock.value += 3.1
+    pipeline.process(packet(5, [("car", 1, (20, 20, 70, 75))]))
+    clock.value += 5.1
+    pipeline.process(add_quality_plate(
+        packet(6, [("car", 1, (20, 20, 70, 75))]), "KA01AB1234", .75,
+    ))
+    clock.value += .1
+    pipeline.process(add_quality_plate(
+        packet(7, [("car", 1, (20, 20, 70, 75))]), "KA01AB1234", .75,
+    ))
+    clock.value += 2.6
+    pipeline.process(packet(8, [("car", 1, (20, 20, 70, 75))]))
     reads = sorted((item for item in events(tmp_path) if item["event_type"] == "plate_read"),
                    key=lambda item: item["confidence"])
-    assert [item["confidence"] for item in reads] == [.30, .45]
+    assert [item["confidence"] for item in reads] == [.50, .75]
     assert reads[1]["supersedes_observation_id"] == reads[0]["observation_id"]
 
 
@@ -1200,11 +1547,10 @@ def test_anpr_suppresses_noisy_alternate_plate_for_same_presence(tmp_path, monke
     for index in range(3):
         pipeline.process(packet(index, [("car", 9, (20, 20, 70, 75))]))
         clock.value += .1
-    good = packet(3, [("car", 9, (20, 20, 70, 75))])
-    good.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                           confidence=.9,
-                                           metadata={"ocr_text": "KA03NP4277", "ocr_confidence": .95},
-                                           parent_id=9))
+    good = add_quality_plate(
+        packet(3, [("car", 9, (20, 20, 70, 75))]),
+        "KA03NP4277", .95, parent_id=9,
+    )
     pipeline.process(good)
     for index, (text, confidence) in enumerate([
         ("KA03BP4277", .91),
@@ -1213,11 +1559,10 @@ def test_anpr_suppresses_noisy_alternate_plate_for_same_presence(tmp_path, monke
         ("AP22A8777", .47),
     ], start=4):
         clock.value += 6
-        noisy = packet(index, [("car", 9, (20, 20, 70, 75))])
-        noisy.detections.append(SimpleNamespace(model_name="license_plate", bbox=(30, 50, 50, 60),
-                                                confidence=.9,
-                                                metadata={"ocr_text": text, "ocr_confidence": confidence},
-                                                parent_id=9))
+        noisy = add_quality_plate(
+            packet(index, [("car", 9, (20, 20, 70, 75))]),
+            text, confidence, parent_id=9,
+        )
         pipeline.process(noisy)
     reads = [item for item in events(tmp_path) if item["event_type"] == "plate_read"]
     assert [item["plate_text"] for item in reads] == ["KA03NP4277"]

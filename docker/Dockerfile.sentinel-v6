@@ -16,6 +16,7 @@ ENV PYTHONUNBUFFERED=1 \
     FACE_MODELS_DIR=/models/face/openvino \
     SCENE_MODEL_PATH=/models/scene/openvino/siglip2-base-patch16-224.xml \
     SCENE_EMBEDDER_DEVICE=GPU \
+    SMOKE_FIRE_DEVICE=NPU \
     REID_MODELS_DIR=/models/surveillance \
     BODY_REID_DEVICE=NPU \
     GAIT_DEVICE=NPU \
@@ -36,6 +37,8 @@ ENV PYTHONUNBUFFERED=1 \
     FACE_ADAPTIVE_IMPROVEMENT_THRESHOLD=0.10 \
     SENTINEL_MOTION_GATE_ENABLED=true \
     SENTINEL_SURFACE_MOTION_GATE_ENABLED=false \
+    SENTINEL_FFMPEG_THREADS=1 \
+    SENTINEL_OPENCV_THREADS=1 \
     APEX_API_HOST=0.0.0.0 \
     APEX_API_PORT=8080 \
     DESIRED_STATE_RELOAD_INTERVAL=2 \
@@ -80,6 +83,7 @@ RUN apt-get update \
         services/worker/pipeline/resource_metrics.py \
         services/worker/pipeline/runtime_telemetry.py \
         services/worker/pipeline/runtime_status.py \
+        services/worker/pipeline/shared_vehicle_inference.py \
         services/worker/pipeline/structured_logging.py \
         services/worker/pipeline/scene_embeddings.py \
         services/worker/pipeline/person_reid.py \
@@ -110,8 +114,9 @@ RUN apt-get update \
     && chown -R apexruntime:apexruntime /tmp/sentinel \
     && test "$(id -u apexruntime)" = "10001"
 
-ARG IMAGE_VERSION=2026.10.29-v6-dev24
+ARG IMAGE_VERSION=2026.10.30-v6-dev39
 ARG INTEL_TRAFFIC_RUNTIME_BASE_DIGEST=unresolved
+ARG INTEL_TRAFFIC_RUNTIME_BASE_NAME=unresolved
 
 LABEL org.opencontainers.image.source="https://github.com/kiranmaibattu-cyber/sentry_cv" \
       org.opencontainers.image.title="Sentinel CV Runtime" \
@@ -129,6 +134,7 @@ LABEL org.opencontainers.image.source="https://github.com/kiranmaibattu-cyber/se
       io.apexfabric.identity.recognition-policy="face-only" \
       io.apexfabric.action-context.included="false" \
       io.apexfabric.policy-clip-capture.included="false" \
+      io.apexfabric.parent-base="${INTEL_TRAFFIC_RUNTIME_BASE_NAME}" \
       io.apexfabric.runtime-base.digest="${INTEL_TRAFFIC_RUNTIME_BASE_DIGEST}"
 
 EXPOSE 8080

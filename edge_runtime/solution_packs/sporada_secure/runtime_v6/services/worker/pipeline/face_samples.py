@@ -557,6 +557,7 @@ class FaceSamplePipeline:
 
     def process(self, packet, people: list) -> list[Any]:
         if packet.index % self.interval:
+            packet.analytics_state["adaptive_face_observation"] = {"evaluated": False}
             return []
         now = time.time()
         self._refresh_policy()
@@ -571,8 +572,10 @@ class FaceSamplePipeline:
         due = [person for person in eligible
                if self.adaptive_scheduler.due(int(person.metadata["track_id"]), now)]
         faces = self.extractor.extract(packet.frame, due)
+        suppressions = {}
         if hasattr(self.extractor, "drain_suppressions"):
-            for reason, count in self.extractor.drain_suppressions().items():
+            suppressions = self.extractor.drain_suppressions()
+            for reason, count in suppressions.items():
                 self.metrics.suppressed(reason, count)
         self.metrics.tracks(len(faces))
         faces_by_track = {int(face.track_id): face for face in faces}
@@ -630,6 +633,14 @@ class FaceSamplePipeline:
             else:
                 self.metrics.suppressed("duplicate")
 
+        packet.analytics_state["adaptive_face_observation"] = {
+            "evaluated": True,
+            "eligible_tracks": len(eligible),
+            "due_tracks": len(due),
+            "detected_faces": len(faces),
+            "usable_faces": len(usable),
+            "suppressions": dict(suppressions),
+        }
         return usable
 
     def _prune_outbox(self, reserve_records: int = 0) -> None:

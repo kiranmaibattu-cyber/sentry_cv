@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
+import math
+import statistics
 from typing import Sequence
 
 import numpy as np
@@ -283,6 +285,8 @@ class DetectionTrackerStage:
         class_switch_cost: float = 0.15,
         class_aware: bool = True,
         draw_predictions: bool = True,
+        target_fps: float = 5.0,
+        adaptive: bool = True,
     ):
         self.model_name = model_name
         self.metadata_key = metadata_key
@@ -294,6 +298,10 @@ class DetectionTrackerStage:
         self.bbox_smoothing = bbox_smoothing
         self.min_iou = min_iou
         self.class_switch_cost = class_switch_cost
+        self.target_fps = max(1.0, float(target_fps))
+        self.adaptive = bool(adaptive)
+        self._object_scales: dict[str, deque[float]] = {}
+        self._effective_policy: dict[str, dict[str, float]] = {}
 
     def process(self, packets: Sequence[FramePacket]) -> None:
         for packet in packets:
@@ -312,6 +320,11 @@ class DetectionTrackerStage:
                     class_switch_cost=self.class_switch_cost,
                 ),
             )
+            if self.adaptive:
+                policy = self._adapt_tracker(packet, detections, tracker)
+                tracker.max_distance = policy["max_distance_px"]
+                tracker.max_disappeared = int(policy["max_disappeared_frames"])
+                packet.analytics_state["adaptive_tracker_policy"] = dict(policy)
             skipped_models = packet.analytics_state.get("_skipped_detection_models") or []
             if self.model_name in skipped_models:
                 for object_id in tracker.predict():
@@ -339,6 +352,12 @@ class DetectionTrackerStage:
                         },
                     )
                     packet.detections.append(detection)
+                packet.analytics_state["adaptive_tracker_observation"] = {
+                    "detector_evaluated": False,
+                    "active_tracks": len(tracker.objects),
+                    "matched_tracks": 0,
+                    "predicted_tracks": len(tracker.objects),
+                }
                 continue
             matches = tracker.update(detections, class_aware=self.class_aware)
             for detection_index, object_id in matches.items():
@@ -358,6 +377,63 @@ class DetectionTrackerStage:
                 if clipped_bbox is None:
                     continue
                 detection.bbox = clipped_bbox
+            matched_ids = set(matches.values())
+            # Long tracker retention supports recovery but must not be called
+            # detector dropout after a subject has naturally left the view.
+            # Only newly missed tracks remain expected observations.
+            recent_miss_frames = max(2, round(self.target_fps * 0.6))
+            recently_expected = {
+                object_id for object_id in tracker.objects
+                if object_id in matched_ids
+                or tracker.disappeared.get(object_id, 0) <= recent_miss_frames
+            }
+            active_tracks = len(recently_expected)
+            matched_tracks = len(matched_ids & recently_expected)
+            packet.analytics_state["adaptive_tracker_observation"] = {
+                "detector_evaluated": True,
+                "active_tracks": active_tracks,
+                "matched_tracks": matched_tracks,
+                "predicted_tracks": max(0, active_tracks - matched_tracks),
+                "retained_tracker_memory": len(tracker.objects),
+            }
+
+    def _adapt_tracker(self, packet: FramePacket, detections: Sequence[Detection],
+                       tracker: CentroidTracker) -> dict[str, float]:
+        """Resolution/motion-aware bounded tracker retention and association gate."""
+        height, width = packet.frame.shape[:2]
+        diagonal = math.hypot(width, height)
+        history = self._object_scales.setdefault(packet.name, deque(maxlen=300))
+        bbox_diagonals = []
+        for detection in detections:
+            x1, y1, x2, y2 = detection.bbox
+            box_diagonal = math.hypot(max(1.0, x2 - x1), max(1.0, y2 - y1))
+            bbox_diagonals.append(box_diagonal)
+            history.append(box_diagonal / max(1.0, diagonal))
+        median_scale = float(statistics.median(history)) if history else 0.10
+        median_box = (float(statistics.median(bbox_diagonals))
+                      if bbox_diagonals else median_scale * diagonal)
+        velocities = [float(np.linalg.norm(value)) for value in tracker.velocities.values()]
+        motion_allowance = min(160.0, 2.0 * (max(velocities) if velocities else 0.0))
+        max_distance = min(520.0, max(
+            120.0,
+            0.065 * diagonal + 1.35 * median_box + motion_allowance,
+        ))
+        if median_scale < 0.075:
+            retention_seconds = 18.0
+        elif median_scale < 0.15:
+            retention_seconds = 12.0
+        else:
+            retention_seconds = 8.0
+        if len(detections) >= 12:
+            retention_seconds = max(retention_seconds, 15.0)
+        policy = {
+            "max_distance_px": round(max_distance, 3),
+            "max_disappeared_seconds": retention_seconds,
+            "max_disappeared_frames": float(max(1, round(retention_seconds * self.target_fps))),
+            "median_object_scale": round(median_scale, 5),
+        }
+        self._effective_policy[packet.name] = policy
+        return policy
 
     @staticmethod
     def _clip_bbox(bbox, frame):

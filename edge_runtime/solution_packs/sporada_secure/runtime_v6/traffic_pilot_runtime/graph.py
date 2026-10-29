@@ -25,7 +25,7 @@ NODE_CATALOG = {
     "vehicle_tracker": {"label": "Vehicle Tracker", "kind": "runtime"},
     "plate_detector": {"label": "Plate Detector", "kind": "model", "device": "GPU"},
     "ocr_service": {"label": "OCR Service", "kind": "model", "device": "GPU,NPU"},
-    "smoke_fire_detector": {"label": "Smoke/Fire Detector", "kind": "model", "device": "GPU"},
+    "smoke_fire_detector": {"label": "Smoke/Fire Detector", "kind": "model", "device": "NPU"},
     "face_detector": {"label": "Face Detector", "kind": "model", "device": "GPU"},
     "face_alignment": {"label": "Face Alignment", "kind": "runtime"},
     "face_embedder": {"label": "Face Embedder", "kind": "model", "device": "NPU"},
@@ -120,7 +120,7 @@ def _camera_graph(camera: DesiredCamera) -> CameraGraph:
     if apps & SMOKE_APPS:
         node_ids.extend(["smoke_fire_detector", "snapshot_storage"])
         edge_ids.append(("decode", "smoke_fire_detector"))
-        devices["smoke_fire_detector"] = "GPU"
+        devices["smoke_fire_detector"] = "NPU"
 
     if apps & FACE_APPS:
         node_ids.extend(["face_detector", "face_alignment", "face_embedder",

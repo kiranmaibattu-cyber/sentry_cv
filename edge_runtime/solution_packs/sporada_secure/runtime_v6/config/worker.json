@@ -63,7 +63,7 @@
     "smoke_fire": {
       "path": "/models/openvino/smoke_fire.xml",
       "backend": "openvino",
-      "device": "GPU",
+      "device": "NPU",
       "confidence": 0.35,
       "iou_threshold": 0.45,
       "imgsz": 320,

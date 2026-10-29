@@ -76,7 +76,12 @@ class OpenVINOSmokeFireDetector:
         self._out = self._compiled.output(0)
         self.requested_device = device
         try:
-            self.exec_devices = ",".join(self._compiled.get_property("EXECUTION_DEVICES"))
+            execution_devices = self._compiled.get_property("EXECUTION_DEVICES")
+            self.exec_devices = (
+                execution_devices
+                if isinstance(execution_devices, str)
+                else ",".join(str(item) for item in execution_devices)
+            )
         except Exception:  # noqa: BLE001
             self.exec_devices = resolved
         logger.info(

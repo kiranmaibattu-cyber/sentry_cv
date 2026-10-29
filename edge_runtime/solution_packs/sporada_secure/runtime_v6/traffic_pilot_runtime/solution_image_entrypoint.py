@@ -956,7 +956,6 @@ def _hot_reload_signature(desired: DesiredState) -> tuple[Any, ...]:
                 camera.source,
                 camera.fps,
                 camera.apps,
-                json.dumps(camera.config["v6"]["geometry"], sort_keys=True),
                 tuple(sorted({profile for binding in camera.config["v6"]["bindings"]
                               for profile in binding.get("embedding_profile_ids") or []})),
             )

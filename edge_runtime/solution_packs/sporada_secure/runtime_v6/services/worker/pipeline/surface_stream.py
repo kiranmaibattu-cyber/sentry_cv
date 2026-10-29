@@ -515,7 +515,7 @@ def run_surface_camera(cam: dict, camera_config: dict, redis_host: str,
         telemetry_devices["anpr_plate_detection"] = sf.PLATE_DEVICE
         telemetry_devices["anpr_ocr"] = os.getenv("OCR_DEVICE", "MULTI:GPU,NPU")
     if smoke_fire is not None:
-        telemetry_devices["fire_smoke_detection"] = sf.SMOKE_FIRE_DEVICE
+        telemetry_devices["fire_smoke_detection"] = smoke_fire.exec_devices
     if face_pipeline is not None:
         telemetry_devices.update({
             "face_detection": os.getenv("FACE_DETECTOR_DEVICE", "GPU"),
@@ -807,7 +807,9 @@ def run_surface_camera(cam: dict, camera_config: dict, redis_host: str,
                 )
                 if smoke_evaluated:
                     try:
-                        with telemetry.measure("fire_smoke.detection", device=sf.SMOKE_FIRE_DEVICE):
+                        with telemetry.measure(
+                            "fire_smoke.detection", device=smoke_fire.exec_devices
+                        ):
                             smoke_dets = smoke_fire.detect(frame)
                         stats['smoke'] += 1
                         stats['smoke_detections'] += len(smoke_dets)
@@ -819,8 +821,10 @@ def run_surface_camera(cam: dict, camera_config: dict, redis_host: str,
                     sv, bool(vdets), bool(smoke_dets),
                     fully_evaluated=(smoke_fire is None or smoke_evaluated),
                 )
+                # appsink supplies pixels but this path does not currently
+                # propagate a source/media PTS into FramePacket.
                 packet = _FramePacket(index=fidx, name=name, frame=frame,
-                                      frame_observed_at=frame_received_at,
+                                      frame_observed_at=None,
                                       frame_received_at=frame_received_at)
                 packet.analytics_state["motion_gate"] = gate_state
                 packet.analytics_state['fire_smoke_evaluated'] = smoke_evaluated

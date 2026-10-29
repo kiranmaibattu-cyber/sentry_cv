@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import statistics
 import time
 from time import perf_counter
 from typing import Any
@@ -17,6 +18,7 @@ import uuid
 import cv2
 import numpy as np
 
+from .adaptive_policy import AdaptivePolicyResolver
 from .face_samples import FaceSamplePipeline
 from .sentinel_delivery import SentinelV6Outbox, SentinelV6Uploader
 from .structured_logging import set_stream_session_id
@@ -76,6 +78,8 @@ class V6EventPipeline:
         set_stream_session_id(self.session_id)
         self.scene, self.body, self.gait = scene, body, gait
         self.telemetry = telemetry
+        target_fps = float((config.get("processing") or {}).get("fps", 5.0))
+        self.policy = AdaptivePolicyResolver(camera_id, target_fps=target_fps)
         self.tracks: dict[tuple[str, str], dict[str, Any]] = {}
         self.presences: dict[str, dict[str, Any]] = {}
         self.counts: dict[tuple[str, str | None], dict[str, Any]] = {}
@@ -87,21 +91,22 @@ class V6EventPipeline:
         self.scene_pressure_reported_at = 0.0
         self.hazards: dict[tuple[str, str | None], dict[str, Any]] = {}
         self.face_candidates: dict[str, dict[str, Any]] = {}
-        self.face_selection_window = float(os.getenv("SENTINEL_FACE_SELECTION_WINDOW_SECONDS", "4.0"))
-        self.zone_boundary_margin = float(os.getenv("SENTINEL_ZONE_BOUNDARY_MARGIN", "0.01"))
+        self.face_selection_window = float(self.policy.section("identity")["face_selection_window_seconds"])
+        self.zone_boundary_margin = float(self.policy.section("zone")["boundary_margin"])
         self.candidate_max_gap = float(os.getenv("SENTINEL_CANDIDATE_MAX_GAP_SECONDS", "1.5"))
-        self.hazard_min_confidence = float(os.getenv("SENTINEL_HAZARD_MIN_CONFIDENCE", "0.55"))
-        self.feature_cooldown = float(os.getenv("SENTINEL_FEATURE_IMPROVEMENT_COOLDOWN_SECONDS", "5"))
+        self.hazard_min_confidence = float(self.policy.section("fire_smoke")["event_min_confidence"])
+        self.feature_cooldown = float(self.policy.section("identity")["feature_cooldown_seconds"])
         self.plate_outcome_delay = float(os.getenv("SENTINEL_PLATE_OUTCOME_DELAY_SECONDS", "3"))
         self.plate_confidence_improvement = float(os.getenv("SENTINEL_PLATE_CONFIDENCE_IMPROVEMENT", "0.10"))
         self.plate_update_cooldown = float(os.getenv("SENTINEL_PLATE_UPDATE_COOLDOWN_SECONDS", "5"))
         self.plate_change_min_confidence = float(os.getenv("SENTINEL_PLATE_CHANGE_MIN_CONFIDENCE", "0.90"))
         self.plate_change_margin = float(os.getenv("SENTINEL_PLATE_CHANGE_MARGIN", "0.10"))
         self.plate_low_confidence_replace = float(os.getenv("SENTINEL_PLATE_LOW_CONFIDENCE_REPLACE", "0.50"))
-        self.plate_candidate_window = float(os.getenv("SENTINEL_PLATE_CANDIDATE_WINDOW_SECONDS", "2.0"))
-        self.plate_emit_min_reads = int(os.getenv("SENTINEL_PLATE_EMIT_MIN_READS", "2"))
-        self.plate_emit_min_confidence = float(os.getenv("SENTINEL_PLATE_EMIT_MIN_CONFIDENCE", "0.30"))
-        self.plate_single_read_confidence = float(os.getenv("SENTINEL_PLATE_SINGLE_READ_CONFIDENCE", "0.75"))
+        anpr_policy = self.policy.section("anpr")
+        self.plate_candidate_window = float(anpr_policy["candidate_window_seconds"])
+        self.plate_emit_min_reads = int(anpr_policy["confirm_min_reads"])
+        self.plate_emit_min_confidence = float(anpr_policy["ocr_emit_min_confidence"])
+        self.plate_single_read_confidence = float(anpr_policy["single_read_confidence"])
         self.plate_fast_emit_confidence = float(os.getenv("SENTINEL_PLATE_FAST_EMIT_CONFIDENCE", "0.85"))
         self.presence_close_unobserved_after = float(os.getenv("SENTINEL_PRESENCE_UNOBSERVED_AFTER_SECONDS", "2"))
         self.presence_close_ended_after = float(os.getenv("SENTINEL_PRESENCE_ENDED_UNKNOWN_AFTER_SECONDS", "8"))
@@ -118,6 +123,8 @@ class V6EventPipeline:
         self.last_health = 0.0
         self.health_state = "healthy"
         self.last_reliable_at: float | None = None
+        self.timestamp_source = "edge_received_at"
+        self._publish_policy()
 
     def close(self):
         if self.uploader is not None:
@@ -131,23 +138,53 @@ class V6EventPipeline:
         for candidate in self.face_candidates.values():
             candidate["deadline"] = now
         self._flush_face_candidates(now)
+        previous_zones = self.zones
+        previous_lines = self.lines
         self.config = updated
         self.bindings = list(updated["bindings"])
         geometry = updated.get("geometry") or {}
         self.zones = {item["id"]: item for item in geometry.get("zones") or []}
         self.lines = {item["id"]: item for item in geometry.get("counting_lines") or []}
+        changed_zones = {
+            identifier for identifier in set(previous_zones) | set(self.zones)
+            if previous_zones.get(identifier) != self.zones.get(identifier)
+        }
+        changed_lines = {
+            identifier for identifier in set(previous_lines) | set(self.lines)
+            if previous_lines.get(identifier) != self.lines.get(identifier)
+        }
         binding_by_id = {item["use_case_id"]: item for item in self.bindings}
         for state in self.presences.values():
             owner = state["owner"]
-            if owner is None:
-                continue
-            replacement = binding_by_id.get(owner["use_case_id"])
-            if replacement is not None and replacement["app"] == owner["app"]:
-                state["owner"] = replacement
-                continue
+            replacement = None if owner is None else binding_by_id.get(owner["use_case_id"])
+            if replacement is not None and replacement["app"] != owner["app"]:
+                replacement = None
+
+            affected_episodes = set(state["episodes"]) & changed_zones
+            if affected_episodes:
+                for zone_id in affected_episodes:
+                    state["episodes"][zone_id]["observation_state"] = "ended_unknown"
+                if replacement is not None:
+                    self._emit_material_change_presence(state, replacement, now)
+                for zone_id in affected_episodes:
+                    state["episodes"].pop(zone_id, None)
+
+            for zone_id in changed_zones:
+                state["zone_state"].pop(zone_id, None)
+                state["zone_votes"].pop(zone_id, None)
+                state.setdefault("zone_candidate_since", {}).pop(zone_id, None)
+            state["line_state"] = {
+                key: value for key, value in state["line_state"].items()
+                if key[1] not in changed_lines and key[0] in binding_by_id
+            }
+            state["last_cross"] = {
+                key: value for key, value in state.get("last_cross", {}).items()
+                if key[1] not in changed_lines and key[0] in binding_by_id
+            }
+
             width_height = state.get("frame_size")
             if width_height is None:
-                state["owner"] = None
+                state["owner"] = replacement
                 continue
             width, height = width_height
             box = state["box"]
@@ -155,8 +192,47 @@ class V6EventPipeline:
             containing = {zone_id for zone_id, zone in self.zones.items() if inside(point, zone["poly"])}
             state["owner"] = self._owner(state["kind"], containing)
         enabled_ids = set(binding_by_id)
-        self.counts = {key: value for key, value in self.counts.items() if key[0] in enabled_ids}
-        self.last_scene = {key: value for key, value in self.last_scene.items() if key[0] in enabled_ids}
+        if changed_zones or changed_lines:
+            # Measurements and negative-confirmation state from the old view
+            # must not leak into the revised view. The next evaluated frames
+            # establish fresh count, scene and hazard state.
+            self.counts.clear()
+            self.last_scene.clear()
+            self.hazards.clear()
+            self._persist(self._event(
+                "camera_health", now, None, state="degraded", reason="view_changed",
+                as_of=utc(now),
+                last_reliable_at=utc(self.last_reliable_at)
+                if self.last_reliable_at is not None else None,
+                sampling_gap_seconds=0,
+            ))
+            self.last_health = now
+        else:
+            self.counts = {key: value for key, value in self.counts.items() if key[0] in enabled_ids}
+            self.last_scene = {key: value for key, value in self.last_scene.items() if key[0] in enabled_ids}
+            self.hazards = {key: value for key, value in self.hazards.items() if key[0] in enabled_ids}
+
+    def _emit_material_change_presence(self, state, owner, now) -> None:
+        frame_size = state.get("frame_size")
+        if frame_size is None:
+            return
+        width, height = frame_size
+        source_frame_id = state.get("last_frame_id")
+        if source_frame_id is None:
+            return
+        event = self._event(
+            "object_present", now, source_frame_id, owner["use_case_id"],
+            presence_id=state["id"], track_id=state["track_id"],
+            object_type=state["kind"],
+            vehicle_type=state.get("vehicle_type") if state["kind"] == "vehicle" else None,
+            reason="material_change",
+            bbox_normalized=bbox_normalized(state["box"], width, height),
+            confidence=max(0.0, min(1.0, float(state.get("confidence", 0.0)))),
+            first_seen_at=utc(state["first_seen"]),
+            zone_episodes=self._episodes(state),
+        )
+        self._persist(event)
+        state["last_object"] = now
 
     def camera_status(self, status: str, reason: str) -> str:
         now = time.time()
@@ -167,16 +243,17 @@ class V6EventPipeline:
                 candidate["deadline"] = now
             self._flush_face_candidates(now)
             for state in self.presences.values():
-                if state["hits"] < 3 or state["lost"]:
+                if not state.get("confirmed") or state["lost"]:
                     continue
                 state["lost"] = True
                 for episode in state["episodes"].values():
                     episode["observation_state"] = "unobserved"
-                self._persist(self._event("track_lost", now, None,
-                                          presence_id=state["id"], track_id=state["track_id"],
-                                          object_type=state["kind"], last_seen_at=utc(state["last_seen"]),
-                                          zone_episodes=self._episodes(state),
-                                          reason="stream_interrupted"))
+                if self._lifecycle_enabled(state):
+                    self._persist(self._event("track_lost", now, None,
+                                              presence_id=state["id"], track_id=state["track_id"],
+                                              object_type=state["kind"], last_seen_at=utc(state["last_seen"]),
+                                              zone_episodes=self._episodes(state),
+                                              reason="stream_interrupted"))
             self.health_state = "unavailable"
             self._persist(self._event("camera_health", now, None,
                                       state="unavailable", reason=reason, as_of=utc(now),
@@ -188,14 +265,15 @@ class V6EventPipeline:
                 candidate["deadline"] = now
             self._flush_face_candidates(now)
             for state in self.presences.values():
-                if state["hits"] < 3:
+                if not state.get("confirmed"):
                     continue
                 for episode in state["episodes"].values():
                     episode["observation_state"] = "ended_unknown"
-                self._persist(self._event("presence_ended_unknown", now, None,
-                                          presence_id=state["id"], track_id=state["track_id"],
-                                          object_type=state["kind"], last_seen_at=utc(state["last_seen"]),
-                                          zone_episodes=self._episodes(state)))
+                if self._lifecycle_enabled(state):
+                    self._persist(self._event("presence_ended_unknown", now, None,
+                                              presence_id=state["id"], track_id=state["track_id"],
+                                              object_type=state["kind"], last_seen_at=utc(state["last_seen"]),
+                                              zone_episodes=self._episodes(state)))
             self.tracks.clear()
             self.presences.clear()
             self.counts.clear()
@@ -232,6 +310,34 @@ class V6EventPipeline:
         if self.telemetry is None:
             return nullcontext()
         return self.telemetry.measure(stage, device=device)
+
+    def _publish_policy(self) -> None:
+        identity = self.policy.section("identity")
+        zone = self.policy.section("zone")
+        anpr = self.policy.section("anpr")
+        hazard = self.policy.section("fire_smoke")
+        self.face_selection_window = float(identity["face_selection_window_seconds"])
+        self.feature_cooldown = float(identity["feature_cooldown_seconds"])
+        self.zone_boundary_margin = float(zone["boundary_margin"])
+        self.hazard_min_confidence = float(hazard["event_min_confidence"])
+        self.plate_candidate_window = float(anpr["candidate_window_seconds"])
+        self.plate_emit_min_reads = int(anpr["confirm_min_reads"])
+        self.plate_emit_min_confidence = float(anpr["ocr_emit_min_confidence"])
+        self.plate_single_read_confidence = float(anpr["single_read_confidence"])
+        if self.telemetry is not None:
+            self.telemetry.set_resolved_policy(self.policy.snapshot())
+            self.telemetry.set_timestamp_source(self.timestamp_source)
+
+    def _stable_hits(self, kind: str) -> int:
+        return int(self.policy.section("presence", kind)["stable_hits"])
+
+    @staticmethod
+    def _lifecycle_enabled(state: dict[str, Any]) -> bool:
+        """Lifecycle facts cross the boundary only for an owned subject use case."""
+        owner = state.get("owner")
+        return owner is not None and owner.get("app") in {
+            "vehicle_presence", "person_presence",
+        }
 
     def _evidence(self, event, frame_id, image, kind, bounds, frame_shape, now):
         ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
@@ -284,7 +390,10 @@ class V6EventPipeline:
         eligible = [item for item in self.bindings
                     if item["app"] in {"vehicle_presence", "person_presence", "person_identity", "anpr"}
                     and self._matches(item, kind, containing)]
-        eligible.sort(key=lambda item: (item["app"] not in {"vehicle_presence", "person_presence"}, item["use_case_id"]))
+        eligible.sort(key=lambda item: (
+            item["app"] not in {"vehicle_presence", "person_presence"},
+            item["use_case_id"],
+        ))
         return eligible[0] if eligible else None
 
     @staticmethod
@@ -306,16 +415,24 @@ class V6EventPipeline:
         return class_name if class_name in {"car", "truck", "van", "bus", "motorcycle"} else "other"
 
     def _presence_timeouts(self, state):
+        policy = self.policy.section("presence", state.get("kind"))
+        unobserved = float(policy["unobserved_after_seconds"])
+        ended = float(policy["ended_unknown_after_seconds"])
         width_height = state.get("frame_size")
         if width_height is None:
-            return self.presence_close_unobserved_after, self.presence_close_ended_after
+            return unobserved, ended
         width, height = width_height
         box_width, box_height = self._box_size(state["box"])
         norm_width = box_width / max(1.0, float(width))
         norm_height = box_height / max(1.0, float(height))
         if max(norm_width, norm_height) < 0.12 or min(norm_width, norm_height) < 0.05:
-            return self.presence_wide_unobserved_after, self.presence_wide_ended_after
-        return self.presence_close_unobserved_after, self.presence_close_ended_after
+            # Distant subjects are the most likely to disappear for several
+            # evaluated frames even though they have not left the view. Give
+            # those presences additional camera-local recovery hysteresis,
+            # while retaining a finite unknown-ending bound. Tracker
+            # predictions still do not refresh last_seen or confirm presence.
+            return min(10.0, unobserved * 2.0), min(22.0, ended * 1.1)
+        return unobserved, ended
 
     def _recovery_distance_limit(self, state, box):
         width_height = state.get("frame_size")
@@ -325,13 +442,14 @@ class V6EventPipeline:
         old_w, old_h = self._box_size(state["box"])
         new_w, new_h = self._box_size(box)
         subject_scale = 2.5 * max(old_w, old_h, new_w, new_h)
-        return min(520.0, max(120.0, frame_scale, subject_scale))
+        tracker_limit = float(self.policy.section("tracking").get("max_distance_px", 320.0))
+        return min(520.0, max(120.0, frame_scale, subject_scale, tracker_limit))
 
     def _reassociate(self, kind, box, vector, now, active_keys, class_name=None):
         if kind == "person":
             if vector is None:
                 return None
-            best = None
+            candidates = []
             for state in self.presences.values():
                 if state["kind"] != kind or not state["lost"] or state["track_key"] in active_keys:
                     continue
@@ -341,9 +459,14 @@ class V6EventPipeline:
                 if np.linalg.norm(np.subtract(self._center(box), self._center(state["box"]))) > self._recovery_distance_limit(state, box):
                     continue
                 similarity = float(np.dot(vector, state["body_vector"]))
-                if similarity >= 0.78 and (best is None or similarity > best[0]):
-                    best = similarity, state
-            return best[1] if best else None
+                if similarity >= 0.78:
+                    candidates.append((similarity, state))
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            if not candidates:
+                return None
+            if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.04:
+                return None
+            return candidates[0][1]
 
         if kind != "vehicle":
             return None
@@ -388,9 +511,10 @@ class V6EventPipeline:
     def process_quiet(self, now: float, index: int, frame=None) -> None:
         """Advance lifecycle state for a frame where models did not run.
 
-        Quiet frames are unknown observations. They may age presences toward
-        track_lost/ended_unknown and emit health heartbeats, but they must not
-        produce count=0, zone_exit, fire_smoke_cleared, or other negative facts.
+        Quiet frames are unknown observations. They may emit health heartbeats,
+        flush already-collected candidates and produce an explicitly requested
+        scene sample, but they cannot age presence state. Only a frame on which
+        object inference actually ran may contribute positive absence evidence.
         """
         self.last_reliable_at = now
         if not self.scene_pressure and now - self.last_health >= 30:
@@ -398,7 +522,6 @@ class V6EventPipeline:
             self._persist(self._event("camera_health", now, None, state="healthy", reason="none",
                                       as_of=utc(now), last_reliable_at=utc(now),
                                       sampling_gap_seconds=0))
-        self._lost_and_unknown(set(), now)
         self._flush_face_candidates(now)
         self._plate_idle_timeouts(now)
         if frame is not None:
@@ -406,9 +529,10 @@ class V6EventPipeline:
             self._scenes(SimpleNamespace(frame=frame), now, f"{self.camera_id}:{index}")
 
     def process(self, packet, faces=()):
-        now = (getattr(packet, "frame_observed_at", None)
-               or getattr(packet, "frame_received_at", None)
-               or time.time())
+        observed = getattr(packet, "frame_observed_at", None)
+        received = getattr(packet, "frame_received_at", None)
+        now = observed or received or time.time()
+        self.timestamp_source = "source_pts" if observed is not None else "edge_received_at"
         self.last_reliable_at = now
         frame_id = f"{self.camera_id}:{packet.index}"
         frame = packet.frame
@@ -417,14 +541,35 @@ class V6EventPipeline:
             self.last_health = now
             self._persist(self._event("camera_health", now, None, state="healthy", reason="none",
                                       as_of=utc(now), last_reliable_at=utc(now), sampling_gap_seconds=0))
-        detections = [item for item in packet.detections
-                      if item.model_name == "vehicle" and item.metadata.get("track_id") is not None
-                      and not item.metadata.get("predicted")]
+        tracked_detections = [item for item in packet.detections
+                              if item.model_name == "vehicle"
+                              and item.metadata.get("track_id") is not None]
+        detections = [item for item in tracked_detections
+                      if not item.metadata.get("predicted")]
+        tracker_keys = {
+            ("person" if item.class_name == "pedestrian" else "vehicle",
+             str(item.metadata["track_id"]))
+            for item in tracked_detections
+        }
+        policy_changed = self.policy.observe_frame(
+            frame, tracked_detections, now,
+            getattr(packet, "analytics_state", {}).get("adaptive_tracker_policy"),
+            getattr(packet, "analytics_state", {}).get("adaptive_tracker_observation"),
+            getattr(packet, "analytics_state", {}).get("model_queue_wait_seconds"),
+        )
+        self.policy.observe_face_pipeline(
+            getattr(packet, "analytics_state", {}).get("adaptive_face_observation")
+        )
+        for face in faces:
+            self.policy.observe_face(face, frame.shape)
+        if policy_changed or packet.index % 25 == 0:
+            self._publish_policy()
         active_keys = {("person" if item.class_name == "pedestrian" else "vehicle", str(item.metadata["track_id"])) for item in detections}
         face_by_track = {str(face.track_id): face for face in faces}
         body_vectors = self._body_vectors(packet, detections, now)
         for item in detections:
             kind = "person" if item.class_name == "pedestrian" else "vehicle"
+            stable_hits = self._stable_hits(kind)
             track_id = str(item.metadata["track_id"])
             key = (kind, track_id)
             vector = body_vectors.get(track_id)
@@ -440,6 +585,12 @@ class V6EventPipeline:
                              "last_object": 0.0, "last_feature": {}, "plates": {},
                              "plate_attempts": {}, "plate_outcomes": set(),
                              "lost": False, "body_vector": None,
+                             "confidence": float(item.confidence),
+                             "last_frame_id": frame_id,
+                             "missing_evaluated_since": None,
+                             "missing_evaluations": 0,
+                             "confirmed": False, "zone_candidate_since": {},
+                             "identity_sample_group_id": str(uuid.uuid4()),
                              "vehicle_type": self._vehicle_type(item.class_name) if kind == "vehicle" else None}
                     self.presences[state["id"]] = state
                 else:
@@ -452,12 +603,16 @@ class V6EventPipeline:
             elif state["lost"]:
                 recovered_from = track_id
             previous_last_seen = state["last_seen"]
-            if state["hits"] < 3 and now - previous_last_seen > self.candidate_max_gap:
+            if not state.get("confirmed") and now - previous_last_seen > self.candidate_max_gap:
                 state["hits"] = 0
                 state["first_seen"] = now
             state["hits"] += 1
             state["last_seen"] = now
             state["box"] = item.bbox
+            state["confidence"] = float(item.confidence)
+            state["last_frame_id"] = frame_id
+            state["missing_evaluated_since"] = None
+            state["missing_evaluations"] = 0
             state["frame_size"] = (width, height)
             state["lost"] = False
             if kind == "vehicle":
@@ -465,28 +620,36 @@ class V6EventPipeline:
             if vector is not None:
                 state["body_vector"] = vector
                 state["last_body_at"] = now
-            if state["hits"] < 3:
+            if state["hits"] < stable_hits:
                 continue
+            just_confirmed = not state.get("confirmed", False)
+            state["confirmed"] = True
             point = ((item.bbox[0] + item.bbox[2]) / (2 * width), item.bbox[3] / height)
             containing = {identifier for identifier, zone in self.zones.items() if inside(point, zone["poly"])}
             if recovered_from is not None:
+                # A successful reassociation is evidence of real track
+                # fragmentation. A subject merely leaving the frame is not.
+                self.policy.observe_fragmentation(now)
                 for zone_id, episode in state["episodes"].items():
                     if zone_id in containing:
                         episode["last_confirmed_inside_at"] = utc(now)
                         episode["observation_state"] = "observed_inside"
-                self._persist(self._event("presence_recovered", now, frame_id,
-                                          presence_id=state["id"], previous_track_id=recovered_from,
-                                          track_id=track_id, object_type=kind,
-                                          last_seen_at=utc(previous_last_seen),
-                                          zone_episodes=self._episodes(state)))
-            if state["hits"] == 3:
+                if self._lifecycle_enabled(state):
+                    self._persist(self._event("presence_recovered", now, frame_id,
+                                              presence_id=state["id"], previous_track_id=recovered_from,
+                                              track_id=track_id, object_type=kind,
+                                              last_seen_at=utc(previous_last_seen),
+                                              zone_episodes=self._episodes(state)))
+            if just_confirmed:
                 state["owner"] = self._owner(kind, containing)
                 presence_zones = {zone_id for binding in self.bindings
                                   if binding["app"] in {"vehicle_presence", "person_presence"}
                                   and kind in binding["object_types"]
                                   for zone_id in binding["geometry_ids"]}
                 for zone_id in containing & presence_zones:
-                    if boundary_distance(point, self.zones[zone_id]["poly"]) < self.zone_boundary_margin:
+                    if boundary_distance(point, self.zones[zone_id]["poly"]) < float(
+                        self.policy.section("zone", kind)["boundary_margin"]
+                    ):
                         continue
                     state["zone_state"][zone_id] = True
                     state["episodes"][zone_id] = self._episode(zone_id, now, False)
@@ -507,7 +670,7 @@ class V6EventPipeline:
                         vector, now, frame_id,
                     )
         with self._measure("presence.loss_recovery"):
-            self._lost_and_unknown(active_keys, now)
+            self._lost_and_unknown(active_keys, now, tracker_keys)
         with self._measure("counting.policy"):
             self._counts(packet, detections, now, frame_id)
         with self._measure("anpr.policy"):
@@ -526,9 +689,14 @@ class V6EventPipeline:
                   and item.metadata.get("track_id") is not None]
         due = [item for item in people if now - self.tracks.get(("person", str(item.metadata["track_id"])), {}).get("last_body_at", 0) >= 1]
         crops = []
+        identity_policy = self.policy.section("identity")
+        quality_floor = float(identity_policy["body_quality_floor"])
+        min_width = int(identity_policy["body_min_width_px"])
+        min_height = int(identity_policy["body_min_height_px"])
         for item in due:
             crop, _ = self._crop(packet.frame, item.bbox)
-            if crop is not None and crop.shape[0] >= 64 and crop.shape[1] >= 32 and self._body_quality(crop) >= .2:
+            if (crop is not None and crop.shape[0] >= min_height and crop.shape[1] >= min_width
+                    and self._body_quality(crop) >= quality_floor):
                 crops.append((item, crop))
         if crops:
             with self._measure("person_identity.body_embedding", "NPU"):
@@ -569,17 +737,23 @@ class V6EventPipeline:
                 "entry_observed": entry, "observation_state": "observed_inside"}
 
     def _zones(self, packet, state, containing, point, now, frame_id):
+        policy = self.policy.section("zone", state.get("kind"))
+        required_votes = int(policy["transition_votes"])
+        hold_seconds = float(policy["transition_hold_seconds"])
+        boundary_margin = float(policy["boundary_margin"])
         bindings_by_zone = {}
         for binding in self.bindings:
             if binding["app"] in {"vehicle_presence", "person_presence"} and state["kind"] in binding["object_types"]:
                 for zone_id in binding["geometry_ids"]:
                     bindings_by_zone.setdefault(zone_id, []).append(binding)
         for zone_id, bindings in bindings_by_zone.items():
-            if boundary_distance(point, self.zones[zone_id]["poly"]) < self.zone_boundary_margin:
+            if boundary_distance(point, self.zones[zone_id]["poly"]) < boundary_margin:
                 continue
             current = zone_id in containing
             previous = state["zone_state"].get(zone_id)
             votes = state["zone_votes"].get(zone_id, (current, 0))
+            if votes[0] != current:
+                state.setdefault("zone_candidate_since", {})[zone_id] = now
             votes = (current, votes[1] + 1 if votes[0] == current else 1)
             state["zone_votes"][zone_id] = votes
             if previous is None:
@@ -588,13 +762,16 @@ class V6EventPipeline:
                     state["episodes"][zone_id] = self._episode(zone_id, now, False)
                 continue
             if current == previous:
+                state.setdefault("zone_candidate_since", {}).pop(zone_id, None)
                 if current and zone_id in state["episodes"]:
                     state["episodes"][zone_id]["last_confirmed_inside_at"] = utc(now)
                     state["episodes"][zone_id]["observation_state"] = "observed_inside"
                 continue
-            if votes[1] < 2:
+            candidate_since = state.setdefault("zone_candidate_since", {}).setdefault(zone_id, now)
+            if votes[1] < required_votes or now - candidate_since < hold_seconds:
                 continue
             state["zone_state"][zone_id] = current
+            state["zone_candidate_since"].pop(zone_id, None)
             episode = self._episode(zone_id, now, True) if current else state["episodes"].get(zone_id)
             if episode is None:
                 continue
@@ -688,8 +865,20 @@ class V6EventPipeline:
             return
         binding = sorted(bindings, key=lambda value: value["use_case_id"])[0]
         profiles = set(binding["embedding_profile_ids"])
+        identity_policy = self.policy.section("identity")
         candidates = []
-        if face is not None and "adaface-ir101-v18.1" in profiles:
+        face_width = (float(face.bbox[2] - face.bbox[0]) if face is not None else 0.0)
+        # Native runtime FaceSample objects carry SixDRepNet pose quality. Keep
+        # compatibility with pre-pose sample producers while applying the
+        # adaptive pixel gate to the current production path.
+        face_size_qualified = (
+            face is not None
+            and (not hasattr(face, "pose_quality")
+                 or face_width >= float(identity_policy["face_emit_min_width_px"]))
+        )
+        if (face is not None and "adaface-ir101-v18.1" in profiles
+                and face_size_qualified
+                and float(face.quality) >= float(identity_policy["face_min_quality"])):
             candidates.append(("face", face.embedding, float(face.quality), face.bbox, "adaface-ir101-v18.1", None))
         if body_vector is not None and "transreid-ssl-v18.1" in profiles:
             body_crop, _ = self._crop(packet.frame, item.bbox)
@@ -705,10 +894,11 @@ class V6EventPipeline:
             vector = result.get(int(state["track_id"]))
             if vector is not None:
                 count = len(self.gait.buffers[key])
-                sequence = {"sequence_started_at": utc(self.gait.buffer_times[key][0]),
-                            "sequence_ended_at": utc(self.gait.buffer_times[key][-1]),
-                            "usable_silhouette_count": count}
-                candidates.append(("gait", vector, min(1.0, count / 30), item.bbox, "gaitbase-v18.1", sequence))
+                if count >= int(identity_policy["gait_min_silhouettes"]):
+                    sequence = {"sequence_started_at": utc(self.gait.buffer_times[key][0]),
+                                "sequence_ended_at": utc(self.gait.buffer_times[key][-1]),
+                                "usable_silhouette_count": count}
+                    candidates.append(("gait", vector, min(1.0, count / 30), item.bbox, "gaitbase-v18.1", sequence))
         for kind, vector, quality, box, profile, sequence in candidates:
             previous = state["last_feature"].get(kind)
             improvement = .2 if kind == "gait" else .15 if kind == "body" else .1
@@ -783,42 +973,59 @@ class V6EventPipeline:
         top = max(0, min(height - side, int(round((y1 + y2) / 2 - side / 2))))
         return left, top, left + side, top + side
 
-    def _lost_and_unknown(self, active_keys, now):
+    def _lost_and_unknown(self, active_keys, now, tracker_keys=None):
+        tracker_keys = active_keys if tracker_keys is None else tracker_keys
         for key, state in list(self.tracks.items()):
             if key in active_keys:
                 continue
-            gap = now - state["last_seen"]
-            if state["hits"] < 3:
+            if not state.get("confirmed"):
+                gap = now - state["last_seen"]
                 if gap >= 8:
                     self.tracks.pop(key, None)
                     self.presences.pop(state["id"], None)
                 continue
+            missing_since = state.get("missing_evaluated_since")
+            if missing_since is None:
+                state["missing_evaluated_since"] = now
+                state["missing_evaluations"] = 1
+                continue
+            state["missing_evaluations"] = int(state.get("missing_evaluations", 1)) + 1
+            gap = now - float(missing_since)
             unobserved_after, ended_after = self._presence_timeouts(state)
-            if gap >= unobserved_after and not state["lost"]:
+            if (state["missing_evaluations"] >= 2
+                    and gap >= unobserved_after and key not in tracker_keys
+                    and not state["lost"]):
                 state["lost"] = True
                 for episode in state["episodes"].values():
                     episode["observation_state"] = "unobserved"
-                self._persist(self._event("track_lost", now, None, presence_id=state["id"],
-                                          track_id=state["track_id"], object_type=state["kind"],
-                                          last_seen_at=utc(state["last_seen"]), zone_episodes=self._episodes(state),
-                                          reason="unknown"))
-            if gap >= ended_after:
+                if self._lifecycle_enabled(state):
+                    self._persist(self._event("track_lost", now, None, presence_id=state["id"],
+                                              track_id=state["track_id"], object_type=state["kind"],
+                                              last_seen_at=utc(state["last_seen"]), zone_episodes=self._episodes(state),
+                                              reason="unknown"))
+            if (state["missing_evaluations"] >= 2 and gap >= ended_after
+                    and key not in tracker_keys):
                 for episode in state["episodes"].values():
                     episode["observation_state"] = "ended_unknown"
-                self._persist(self._event("presence_ended_unknown", now, None,
-                                          presence_id=state["id"], track_id=state["track_id"],
-                                          object_type=state["kind"], last_seen_at=utc(state["last_seen"]),
-                                          zone_episodes=self._episodes(state)))
+                if self._lifecycle_enabled(state):
+                    self._persist(self._event("presence_ended_unknown", now, None,
+                                              presence_id=state["id"], track_id=state["track_id"],
+                                              object_type=state["kind"], last_seen_at=utc(state["last_seen"]),
+                                              zone_episodes=self._episodes(state)))
                 self.tracks.pop(key, None)
                 self.presences.pop(state["id"], None)
 
     def _plate_idle_timeouts(self, now):
+        outcome_delay = max(
+            self.plate_outcome_delay,
+            float(self.policy.section("anpr")["candidate_window_seconds"]),
+        )
         for state in self.presences.values():
             if state["kind"] != "vehicle" or state["lost"]:
                 continue
             for use_case_id, attempt in state["plate_attempts"].items():
                 if (use_case_id in state["plates"] or use_case_id in state["plate_outcomes"]
-                        or now - attempt["started"] < self.plate_outcome_delay):
+                        or now - attempt["started"] < outcome_delay):
                     continue
                 selected = self._plate_candidate_ready(attempt, None, now)
                 if selected is not None:
@@ -828,6 +1035,7 @@ class V6EventPipeline:
                         self._emit_plate_read(state, binding, selected, None, now)
                         attempt["started"] = now
                         attempt["candidates"] = []
+                        attempt["seen_ocr_observations"].clear()
                         continue
                 self._emit_plate_outcome(state, use_case_id, attempt)
 
@@ -837,24 +1045,36 @@ class V6EventPipeline:
             kind = "vehicle" if binding["app"] == "vehicle_counting" else "person"
             if binding["app"] not in {"vehicle_counting", "people_counting"}:
                 continue
+            policy = self.policy.section("count", kind)
+            required_votes = int(policy["debounce_observations"])
+            debounce_seconds = float(policy["debounce_seconds"])
+            heartbeat_seconds = float(policy["heartbeat_seconds"])
             areas = binding["geometry_ids"] if binding["scope"] == "geometry" else [None]
             for zone_id in areas:
                 count = 0
                 for item in detections:
                     item_kind = "person" if item.class_name == "pedestrian" else "vehicle"
                     key = (item_kind, str(item.metadata["track_id"]))
-                    if item_kind != kind or self.tracks[key]["hits"] < 3:
+                    track_state = self.tracks.get(key)
+                    if item_kind != kind or track_state is None or not track_state.get("confirmed"):
                         continue
                     point = ((item.bbox[0] + item.bbox[2]) / (2 * width), item.bbox[3] / height)
                     if zone_id is None or inside(point, self.zones[zone_id]["poly"]):
                         count += 1
                 key = (binding["use_case_id"], zone_id)
-                state = self.counts.setdefault(key, {"value": None, "candidate": None, "votes": 0, "sent": 0.0})
+                state = self.counts.setdefault(key, {
+                    "value": None, "candidate": None, "votes": 0,
+                    "candidate_since": now, "sent": 0.0,
+                })
                 if state["candidate"] == count:
                     state["votes"] += 1
                 else:
                     state["candidate"], state["votes"] = count, 1
-                if state["votes"] < 2 or (state["value"] == count and now - state["sent"] < 20):
+                    state["candidate_since"] = now
+                if (state["votes"] < required_votes
+                        or now - state["candidate_since"] < debounce_seconds
+                        or (state["value"] == count
+                            and now - state["sent"] < heartbeat_seconds)):
                     continue
                 self._persist(self._event("zone_count", now, frame_id, binding["use_case_id"],
                                           zone_id=zone_id, object_type=kind, count=count,
@@ -865,6 +1085,7 @@ class V6EventPipeline:
     def _plate_attempt(self, state, use_case_id, now):
         return state["plate_attempts"].setdefault(use_case_id, {
             "started": now, "provisional": False, "candidates": [],
+            "seen_ocr_observations": set(),
             "last_frame": None, "last_frame_id": None, "last_captured_at": now,
             "last_bbox": None, "last_frame_shape": None,
         })
@@ -880,11 +1101,18 @@ class V6EventPipeline:
         crop, _ = self._crop(packet.frame, plate.bbox)
         width = max(1.0, float(plate.bbox[2] - plate.bbox[0]))
         height = max(1.0, float(plate.bbox[3] - plate.bbox[1]))
+        sharpness = self._plate_sharpness(crop)
+        self.policy.observe_plate(
+            width=width, height=height, frame_width=packet.frame.shape[1],
+            sharpness=sharpness, ocr_confidence=confidence, text=text,
+        )
         area_score = min(1.0, (width * height) / 1600.0)
-        sharpness_score = min(1.0, self._plate_sharpness(crop) / 80.0)
+        sharpness_score = min(1.0, sharpness / 80.0)
         score = 0.72 * confidence + 0.18 * area_score + 0.10 * sharpness_score
         return {
             "text": text, "confidence": confidence, "score": score,
+            "width": width, "height": height, "sharpness": sharpness,
+            "aspect_ratio": width / max(1.0, height),
             "bbox": tuple(float(value) for value in plate.bbox),
             "frame": packet.frame.copy(), "frame_shape": packet.frame.shape,
             "frame_id": frame_id, "captured_at": now,
@@ -892,7 +1120,13 @@ class V6EventPipeline:
         }
 
     def _best_plate_candidate(self, attempt):
-        candidates = list(attempt.get("candidates") or [])
+        policy = self.policy.section("anpr")
+        candidates = [candidate for candidate in (attempt.get("candidates") or [])
+                      if candidate["confidence"] >= float(policy["ocr_emit_min_confidence"])
+                      and candidate["width"] >= float(policy["min_plate_width_px"])
+                      and candidate["height"] >= float(policy["min_plate_height_px"])
+                      and candidate["sharpness"] >= float(policy["min_sharpness"])
+                      and 0.8 <= candidate["aspect_ratio"] <= 12.0]
         if not candidates:
             return None, 0
         counts = {}
@@ -924,23 +1158,26 @@ class V6EventPipeline:
                 and confidence >= previous_confidence + self.plate_change_margin)
 
     def _plate_candidate_ready(self, attempt, previous, now):
+        policy = self.policy.section("anpr")
         candidate, read_count = self._best_plate_candidate(attempt)
         if candidate is None:
             return None
-        if candidate["confidence"] < self.plate_emit_min_confidence:
+        emit_min_confidence = float(policy["ocr_emit_min_confidence"])
+        min_reads = int(policy["confirm_min_reads"])
+        candidate_window = float(policy["candidate_window_seconds"])
+        single_read_confidence = float(policy["single_read_confidence"])
+        if candidate["confidence"] < emit_min_confidence:
             return None
         if not self._plate_read_allowed(previous, candidate, now):
             return None
         elapsed = now - attempt["started"]
-        if previous and elapsed >= min(1.0, self.plate_candidate_window):
-            return candidate
-        repeated = read_count >= self.plate_emit_min_reads
+        repeated = read_count >= min_reads
         fast_repeated = repeated and candidate["confidence"] >= self.plate_fast_emit_confidence
         high_single_after_window = (
-            elapsed >= self.plate_candidate_window
-            and candidate["confidence"] >= self.plate_single_read_confidence
+            elapsed >= candidate_window
+            and candidate["confidence"] >= single_read_confidence
         )
-        normal_window = elapsed >= self.plate_candidate_window and repeated
+        normal_window = elapsed >= candidate_window and repeated
         if fast_repeated or high_single_after_window or normal_window:
             return candidate
         return None
@@ -960,6 +1197,7 @@ class V6EventPipeline:
                                "frame", None, candidate["frame_shape"], candidate["captured_at"])
         event["evidence_ids"] = [media[0]["evidence_id"]]
         self._persist(event, [media])
+        self.policy.observe_anpr_outcome(True)
         state["plates"][binding["use_case_id"]] = (
             candidate["text"], event["observation_id"], candidate["confidence"], now,
         )
@@ -978,6 +1216,7 @@ class V6EventPipeline:
             event["evidence_ids"] = [media[0]["evidence_id"]]
             evidence.append(media)
         self._persist(event, evidence)
+        self.policy.observe_anpr_outcome(False)
         state["plate_outcomes"].add(use_case_id)
 
     def _plates(self, packet, now, frame_id):
@@ -987,7 +1226,7 @@ class V6EventPipeline:
                 continue
             key = ("vehicle", str(plate.parent_id))
             state = self.tracks.get(key)
-            if state is None or state["hits"] < 3:
+            if state is None or not state.get("confirmed"):
                 continue
             text = re.sub(r"[^A-Z0-9? -]", "", str(plate.metadata.get("ocr_text") or "").upper()).strip()[:32]
             point = ((state["box"][0] + state["box"][2]) / (2 * width), state["box"][3] / height)
@@ -1004,28 +1243,48 @@ class V6EventPipeline:
                 attempt["last_frame_shape"] = packet.frame.shape
                 attempt["provisional"] = attempt["provisional"] or bool(plate.metadata.get("ocr_provisional"))
                 if not text:
+                    plate_crop, _ = self._crop(packet.frame, plate.bbox)
+                    self.policy.observe_plate(
+                        width=max(1.0, float(plate.bbox[2] - plate.bbox[0])),
+                        height=max(1.0, float(plate.bbox[3] - plate.bbox[1])),
+                        frame_width=packet.frame.shape[1],
+                        sharpness=self._plate_sharpness(plate_crop),
+                    )
+                    outcome_delay = max(
+                        self.plate_outcome_delay,
+                        float(self.policy.section("anpr")["candidate_window_seconds"]),
+                    )
                     if (use_case_id not in state["plate_outcomes"]
-                            and now - attempt["started"] >= self.plate_outcome_delay):
+                            and now - attempt["started"] >= outcome_delay):
                         self._emit_plate_outcome(state, use_case_id, attempt)
                     continue
                 confidence = plate.metadata.get("ocr_confidence", plate.confidence)
                 confidence = max(0.0, min(1.0, float(confidence)))
-                attempt["candidates"].append(
-                    self._plate_candidate(packet, plate, text, confidence, containing, now, frame_id)
-                )
+                observation_token = str(plate.metadata.get("ocr_observation_id") or frame_id)
+                if observation_token not in attempt["seen_ocr_observations"]:
+                    attempt["seen_ocr_observations"].add(observation_token)
+                    attempt["candidates"].append(
+                        self._plate_candidate(packet, plate, text, confidence, containing, now, frame_id)
+                    )
+                    attempt["candidates"] = attempt["candidates"][-24:]
                 previous = state["plates"].get(use_case_id)
                 selected = self._plate_candidate_ready(attempt, previous, now)
                 if selected is not None:
                     self._emit_plate_read(state, binding, selected, previous, now)
                     attempt["started"] = now
                     attempt["candidates"] = []
+                    attempt["seen_ocr_observations"].clear()
                     state["plate_outcomes"].discard(use_case_id)
         for state in self.presences.values():
             if state["kind"] != "vehicle" or state["lost"]:
                 continue
+            outcome_delay = max(
+                self.plate_outcome_delay,
+                float(self.policy.section("anpr")["candidate_window_seconds"]),
+            )
             for use_case_id, attempt in state["plate_attempts"].items():
                 if (use_case_id in state["plates"] or use_case_id in state["plate_outcomes"]
-                        or now - attempt["started"] < self.plate_outcome_delay):
+                        or now - attempt["started"] < outcome_delay):
                     continue
                 selected = self._plate_candidate_ready(attempt, None, now)
                 if selected is not None:
@@ -1035,12 +1294,20 @@ class V6EventPipeline:
                         self._emit_plate_read(state, binding, selected, None, now)
                         attempt["started"] = now
                         attempt["candidates"] = []
+                        attempt["seen_ocr_observations"].clear()
                         continue
                 self._emit_plate_outcome(state, use_case_id, attempt)
 
     def _hazards(self, packet, now, frame_id):
         if not getattr(packet, "analytics_state", {}).get("fire_smoke_evaluated", True):
             return
+        policy = self.policy.section("fire_smoke")
+        min_confidence = float(policy["event_min_confidence"])
+        positive_needed = int(policy["positive_confirmations"])
+        positive_window = float(policy["positive_window_seconds"])
+        clear_seconds = float(policy["clear_seconds"])
+        clear_needed = int(policy["clear_confirmations"])
+        clear_max_gap = float(policy["clear_max_evaluation_gap_seconds"])
         for binding in self.bindings:
             if binding["app"] != "fire_smoke":
                 continue
@@ -1048,49 +1315,89 @@ class V6EventPipeline:
             for zone_id in zones:
                 for hazard in ("fire", "smoke"):
                     positives = [item for item in packet.detections if item.model_name == "smoke_fire"
-                                 and item.class_name == hazard and item.confidence >= self.hazard_min_confidence and
+                                 and item.class_name == hazard and item.confidence >= min_confidence and
                                  (zone_id is None or inside(((item.bbox[0] + item.bbox[2]) / (2 * packet.frame.shape[1]),
                                                               (item.bbox[1] + item.bbox[3]) / (2 * packet.frame.shape[0])),
                                                              self.zones[zone_id]["poly"]))]
                     key = (binding["use_case_id"], zone_id, hazard)
-                    state = self.hazards.setdefault(key, {"positive": 0, "positive_started": None,
-                                                          "negative_started": None, "episode": None})
-                    if positives:
-                        if state["positive_started"] is None or now - state["positive_started"] > 2:
-                            state["positive_started"], state["positive"] = now, 1
-                        else:
-                            state["positive"] += 1
+                    state = self.hazards.setdefault(key, {
+                        "positive_samples": [], "last_bbox": None,
+                        "negative_started": None, "negative_count": 0,
+                        "last_evaluated_at": None, "episode": None,
+                    })
+                    if (state["last_evaluated_at"] is not None
+                            and now - state["last_evaluated_at"] > clear_max_gap):
                         state["negative_started"] = None
+                        state["negative_count"] = 0
+                    state["last_evaluated_at"] = now
+                    if positives:
+                        best = max(positives, key=lambda item: item.confidence)
+                        prior_box = state.get("last_bbox")
+                        if prior_box is not None and self._bbox_iou(prior_box, best.bbox) < 0.05:
+                            state["positive_samples"] = []
+                        state["last_bbox"] = tuple(best.bbox)
+                        state["positive_samples"].append((now, float(best.confidence)))
+                        state["positive_samples"] = [sample for sample in state["positive_samples"]
+                                                     if now - sample[0] <= positive_window]
+                        state["negative_started"] = None
+                        state["negative_count"] = 0
                     else:
-                        state["positive"], state["positive_started"] = 0, None
+                        state["positive_samples"] = []
+                        state["last_bbox"] = None
                         if state["negative_started"] is None:
                             state["negative_started"] = now
-                    if state["episode"] is None and state["positive"] >= 3:
+                            state["negative_count"] = 1
+                        else:
+                            state["negative_count"] += 1
+                    scores = [sample[1] for sample in state["positive_samples"]]
+                    if state["episode"] is None and len(scores) >= positive_needed:
                         state["episode"] = str(uuid.uuid4())
                         event = self._event("fire_smoke_suspected", now, frame_id, binding["use_case_id"],
                                             hazard=hazard, zone_id=zone_id,
-                                            score=max(0.0, min(1.0, float(max(item.confidence for item in positives)))),
+                                            score=max(0.0, min(1.0, float(statistics.median(scores)))),
                                             hazard_episode_id=state["episode"])
                         media = self._evidence(event, frame_id, packet.frame, "frame", None, packet.frame.shape, now)
                         event["evidence_ids"] = [media[0]["evidence_id"]]
                         self._persist(event, [media])
                     if (state["episode"] is not None and state["negative_started"] is not None
-                            and now - state["negative_started"] >= 10):
+                            and state["negative_count"] >= clear_needed
+                            and now - state["negative_started"] >= clear_seconds):
                         self._persist(self._event("fire_smoke_cleared", now, frame_id, binding["use_case_id"],
                                                   hazard=hazard, zone_id=zone_id,
                                                   hazard_episode_id=state["episode"]))
                         state["episode"] = None
 
+    @staticmethod
+    def _bbox_iou(first, second):
+        left = max(float(first[0]), float(second[0]))
+        top = max(float(first[1]), float(second[1]))
+        right = min(float(first[2]), float(second[2]))
+        bottom = min(float(first[3]), float(second[3]))
+        intersection = max(0.0, right - left) * max(0.0, bottom - top)
+        area_a = max(0.0, float(first[2]) - float(first[0])) * max(0.0, float(first[3]) - float(first[1]))
+        area_b = max(0.0, float(second[2]) - float(second[0])) * max(0.0, float(second[3]) - float(second[1]))
+        union = area_a + area_b - intersection
+        return intersection / union if union > 0 else 0.0
+
     def _scenes(self, packet, now, frame_id):
         if self.scene is None:
             return
+        # Refresh pressure before consulting the adaptive scene controls. Event-
+        # triggered samples still pass through _scene_capacity independently.
+        if not self._scene_capacity(now):
+            return
+        scene_policy = self.policy.snapshot()["scene"]
+        if not scene_policy["optional_sampling_allowed"]:
+            return
+        interval_multiplier = float(scene_policy["pressure_interval_multiplier"])
         for binding in self.bindings:
             if binding["app"] != "scene_search":
                 continue
             areas = binding["geometry_ids"] if binding["scope"] == "geometry" else [None]
             for zone_id in areas:
                 key = (binding["use_case_id"], zone_id)
-                if now - self.last_scene.get(key, 0) >= binding["sample_interval_seconds"]:
+                interval = float(binding["sample_interval_seconds"]) * interval_multiplier
+                if now - self.last_scene.get(key, 0) >= interval:
                     self._scene(packet, binding, zone_id, now, frame_id, "interval")
 
     def _trigger_scene(self, packet, use_case_id, observation_id, now, frame_id):
@@ -1147,6 +1454,10 @@ class V6EventPipeline:
                         continue
             was_pressured = self.scene_pressure
             self.scene_pressure = pending_bytes >= self.scene_pressure_limit
+            self.policy.observe_pressure(
+                outbox_pending_bytes=pending_bytes,
+                outbox_limit_bytes=self.scene_pressure_limit,
+            )
             if was_pressured and not self.scene_pressure:
                 self._persist(self._event("camera_health", now, None,
                                           state="healthy", reason="none", as_of=utc(now),

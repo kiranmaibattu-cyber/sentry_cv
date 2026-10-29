@@ -1,14 +1,14 @@
 # Sentinel V6.0 Development Image
 
-Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.29-v6-dev25`
+Current local image: `ghcr.io/kiranmaibattu-cyber/sentinel-cv-runtime:intel-285h-2026.10.30-v6-dev39`
 
-Image ID: `cb5ec20698878feec22ac108902c5ab344e2b3af78e665658a2a298c49dab132`
+Image ID: `d43d03ad200391a80f7f5038aca5fe0fed4481d2805bef8f610896b2e64a0cf6`
 
-Local digest: `sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3`
+Local digest: `sha256:aae3a9ed26a83b9e93958b74dcd02dde7a232ff85d1301f99014243dda9b0a29`
 
-Registry digest: `sha256:20e401ee00ce3f7b92d21983284d9b01477e223a9ac818691097f54b2db987b3`
+Registry digest: `sha256:aae3a9ed26a83b9e93958b74dcd02dde7a232ff85d1301f99014243dda9b0a29`.
 
-Publication status: pushed to the personal `kiranmaibattu-cyber` GHCR namespace.
+Publication status: published to the personal Kiranmai GHCR repository.
 
 Build: `bash scripts/build_sentinel_v6_image.sh`
 
@@ -21,6 +21,82 @@ profiles are initialized. Recheck, action recognition, and policy clips remain
 deferred by the contract.
 
 ## Verified
+
+- Dev39 reports decoded-frame receipt as `edge_received_at` instead of falsely
+  claiming camera/source PTS. Its OCI metadata records the exact parent tag and
+  image ID. Geometry-only desired-state changes preserve the worker, stream
+  session and presence IDs, close affected episodes as uncertain, reset
+  geometry-local state, and never invent an entry/exit transition.
+- Motion-gate quiet frames no longer age presence lifecycle state. Predicted
+  tracker boxes retain association but never refresh a real observation, and
+  small/distant subjects receive a bounded 2x unobserved window (maximum ten
+  seconds). The runtime suite passes 78 tests.
+- Live trigger qualification produced schema-valid AdaFace face samples with
+  512D embeddings, TransReID body samples, GaitBase gait samples, actual line
+  crossings, and a real `fire_smoke_suspected` smoke observation with frame
+  evidence. All tested Event/Evidence/Embedding references were intact.
+
+- Dev33 bounds each VAAPI FFmpeg decoder/filter pool and OpenCV to one CPU
+  thread instead of creating host-sized pools for every camera. A mixed
+  all-scene live test validated 23 cameras at a requested 8 FPS: all 23 were
+  healthy, mean decoded FPS was 8.093, memory was 10.5 GB, and there were no
+  GPU rejections, shared-inference timeouts, decoder reconnects or camera
+  failures. A 24-camera run failed with GPU resource pressure, establishing 23
+  as the current measured ceiling for this workload. The runtime suite passes
+  73 tests; V6.0 wire schemas and production policy are unchanged.
+
+- Dev32 moves the fire/smoke OpenVINO model from GPU to the Intel NPU with an
+  explicit `NPU` placement and no CPU/AUTO fallback. The model compiled and
+  warmed on Intel AI Boost, then sustained a 16-camera mixed 8 FPS workload
+  alongside scene, ANPR and identity pipelines. Final decoded FPS averaged
+  7.975 (7.756 minimum), fire/smoke inference averaged approximately 15 ms,
+  and the run had no inference timeout, accelerator-resource rejection,
+  decoder restart or fire/smoke inference skip. `/healthz` reports both the
+  actual NPU placement and NPU-attributed model calls. The runtime suite passes
+  72 tests; V6.0 wire schemas are unchanged.
+
+- Dev31 completes the bounded adaptive resolver using separate frame-relative
+  person/vehicle geometry, recently expected-track dropout, recovered-track
+  fragmentation, plate pixels/coverage/sharpness/OCR stability, face
+  pixels/SixDRepNet pose/quality, observed FPS and pressure. A live TCP10 run
+  held 5.026 decoded/inference FPS, correctly resolved distant people as
+  tolerant while vehicles remained balanced, persisted 55 packages with no
+  broken Event/Evidence/Embedding references, and logged no warnings/errors.
+  The policy suite passes 71 tests and the V6.0 wire schemas are unchanged.
+
+- Dev29 requires a continuous sequence of at least five evaluated negative
+  hazard observations over ten seconds before `fire_smoke_cleared`; an
+  unevaluated gap over 2.5 seconds resets the clear candidate. The final image
+  smoke test reached healthy state at 4.82 decoded/inference FPS, exposed the
+  exact resolved clear gates, and logged no warning/error.
+
+- Dev28 implements the bounded adaptive production policy while keeping the
+  V6.0 wire schemas unchanged. `/healthz` reports the effective per-camera
+  tracking, presence, zone, count, ANPR, identity and hazard gates, their
+  measured inputs, policy revision and timestamp source.
+- A solo 13-camera run (three RTSPS plus ten MPEG-TS/TCP) held all cameras
+  healthy near 5 decoded FPS. Cameras independently resolved strict, balanced,
+  and tolerant-collection profiles. A count-only run emitted no object/lost/
+  recovered/ended presence lifecycle traffic.
+- Two one-camera full-app runs persisted schema-validated V6 packages with no
+  broken Event/Evidence/Embedding references. The vehicle-heavy run produced
+  142 packages, 86 evidence assets and 28 embeddings (384D body, 4096D gait,
+  and 768D scene), explicit unreadable plate outcomes, two gated plate reads,
+  and no fire/smoke event. These plate strings are not ground-truth certified.
+- The runtime policy suite passes 71 tests, including adaptive hysteresis,
+  count-only lifecycle suppression, ANPR best-candidate selection, positive
+  zone transitions, hazard confirmation and strict package linkage.
+
+- Dev27 uses one compiled vehicle/person GPU model, private per-camera mmap
+  input slots, fair round-robin admission and four batch-one asynchronous
+  OpenVINO requests. Tracking, policy, evidence and V6 delivery remain in each
+  camera process. Non-blocking admission prevents a fifth submission from
+  delaying Python completion callbacks while all four requests are occupied.
+  A 13-camera RTSPS/TCP test held all cameras healthy around their 5 FPS target
+  with no inference timeout, GPU-resource error, process failure or scheduler
+  failure. See `SENTINEL_V6_DEV27_SHARED_INFERENCE_ARCHITECTURE.md`.
+- Dev27 contract validation passes five schemas, 16 representative outputs and
+  1/8/16/50-camera configurations. The runtime suite passed 67 tests.
 
 - Dev25 embeds the same canonical desired-state example as the source contract.
   Inactive V4 scene and person-ReID publishers were removed; the retained
@@ -81,7 +157,11 @@ deferred by the contract.
   every boundary object carried `schema_version: "6.0"`.
 - V6.0 runtime tests pass (26): desired-state rejection, count/presence/zone episodes, boundary jitter, bounded candidate confirmation, loss/recovery, ANPR read/correction/outcome, loosened OCR gates, confidence-improvement superseding reads, face best-candidate selection and cooldown, independent face/body samples, line crossing, timed hazard clear and score gate, scene pressure, fail-closed accelerator/decode configuration, and ordered upload.
 - V6.0 inference requests only GPU/NPU. The worker rejects CPU/AUTO device configuration; fire/smoke and OCR no longer select CPU if requested accelerators are absent. VA-API decode is mandatory, and `OV_DECODE_HW=0` raises an error in the packaged image. CPU preprocessing, color conversion, tracking, and serialization still occur.
-- Presence candidates require three observations within a bounded gap. Zone transitions require two clear observations beyond a normalized boundary margin. Fire/smoke requires three qualifying evaluated frames within two seconds and ten seconds of evaluated negatives to clear. The edge records decoded-frame receipt time before inference, rather than the later Event creation time. Face/body improvements have a five-second cooldown; camera-health heartbeat is 30 seconds.
+- Presence candidates require three observations by default within a bounded
+  gap. Zone/count, recovery, ANPR, identity, and hazard gates now come from the
+  bounded adaptive profile documented in `SENTINEL_V6_PRODUCTION_POLICY.md`.
+  The edge records decoded-frame receipt/source PTS before inference rather
+  than the later Event creation time. Camera-health heartbeat is 30 seconds.
 - A local HTTP receiver verified authenticated V6 Event -> Evidence -> Embedding upload, V6 acknowledgement, and outbox cleanup. It is not the real Management service.
 - Stream interruption now emits camera-unavailable and track-lost, and recovery ends old presences as unknown under the old stream session before opening a new one. Binding-only revisions preserve the session and presence IDs in tests.
 - Full V6.0 example desired state validated and translated inside the container.
@@ -99,11 +179,16 @@ deferred by the contract.
   Intel throughput and memory are currently measured only for the one-camera
   full-app profile and older smaller multi-camera profiles. Do not infer that
   50 full-app 1080p cameras fit the current 14 GiB resource limit.
-- The dev19 RTSPS view produced repeated person track-loss/recovery transitions.
-  This requires comparison with visual ground truth before changing association
-  or lifecycle gates. The view did not contain qualifying ANPR, line-crossing,
-  fire/smoke, or high-quality face observations, so those final triggers were
-  not certified by that run.
+- Person lifecycle churn is now guarded against motion-quiet intervals,
+  tracker-retained predictions, and short small-subject dropouts. Genuine
+  detector absence beyond the resolved adaptive window still emits
+  `track_lost` and can later recover or end unknown; visual ground truth is
+  still required to classify each such transition as correct.
+- The supplied motorcycle plate image did not achieve an exact OCR
+  ground-truth match: the model returned `KA05KP8667`/`KA05KP8677` while the
+  visible plate appears to be `KA05KP0667`. Crop preprocessing variants did
+  not correct the character. This is an OCR model-quality limitation, not a
+  reason to add an Indian-format regex or silently alter uncertain text.
 - No real Management V6 ingest endpoint was connected. The live runs used the local outbox; Management acceptance, retention, backpressure, and replay remain unverified.
 - Any persisted 5.2 outbox must be drained with the previous image before
   upgrading; partially acknowledged records are not automatically migrated.
@@ -111,7 +196,10 @@ deferred by the contract.
 - The full-app single-camera profile did not meet its requested 8 fps. Three-camera and four-camera capacity with that full app set remain unverified.
 - The `dev3` full-app run emitted a 0.40-score smoke suspicion on a frame without obvious smoke. `dev4` adds a 0.55 edge emission floor, but hazard precision/recall still needs a labelled video set; raising a threshold is not proof of accuracy.
 - The three-camera run accumulated about 121 MB of queued V6.0 records in 125 seconds with no uploader. It also emitted high presence churn: traffic1 had 509 object_present, 686 track_lost, and 465 presence_ended_unknown records; traffic2 had 302, 422, and 270. These streams may have high subject turnover, but production gate/dedup calibration and live inspection are needed before treating these as trustworthy Management Events.
-- Source/geometry/model-profile revisions still restart workers; old presences are not explicitly closed across that restart. Binding-only revisions are preserved in unit tests, but live hot-reload acknowledgement is not yet proven. View-change detection is not implemented.
+- Source/model-profile revisions still restart affected workers. Geometry-only
+  revisions are now applied without restarting the camera process; a live test
+  preserved worker PID and stream session while updating the revision and
+  emitting a `camera_health` `view_changed` record.
 - RTSP source PTS/camera capture time is not available in the current decoder. `observed_at` now uses edge decoded-frame receipt time, which is earlier than processing time but is not camera-origin capture time.
 - Vehicle track reassociation remains conservative (new presence after tracker-ID break); person reassociation uses a qualifying body vector. Four-camera capacity, 1-second scene sampling, and scene-pressure behavior under sustained load remain unvalidated.
 - V6.0 contract acceptance, exact face/body/gait model weight hashes, and full production-policy calibration remain open.

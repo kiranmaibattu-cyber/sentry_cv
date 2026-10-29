@@ -1,7 +1,7 @@
 # Sentinel V6.0 Production Event Policy
 
-Status: proposed production policy for V6.0 runtime hardening
-Date: 2026-10-09
+Status: implemented production-policy baseline for V6.0 runtime hardening
+Date: 2026-10-29
 Scope: adaptive gates, presence continuity, event emission, evidence selection,
 embeddings, ANPR, dwell support, scene sampling, health, and timestamp semantics.
 
@@ -51,8 +51,9 @@ and report `timestamp_source=edge_received_at`.
 
 ## 3. Adaptive Policy Resolver
 
-The runtime should resolve gates per camera and use case, then report the
-resolved values to Management as policy telemetry.
+The runtime resolves bounded gates per camera and subsystem, then reports the
+effective values in `/healthz` under each camera's `resolved_policy`. Resolved
+policy is operational telemetry, not a desired-state input and not an Event.
 
 Inputs to the resolver:
 
@@ -64,6 +65,35 @@ Inputs to the resolver:
 - Track fragmentation rate.
 - OCR stability and unreadable rate.
 - Outbox and model queue pressure.
+
+The implementation keeps separate person and vehicle distributions. For every
+real (non-predicted) tracked detection it records:
+
+```text
+area_coverage = bbox_area / frame_area
+object_scale  = sqrt(area_coverage)
+width_ratio   = bbox_width / frame_width
+height_ratio  = bbox_height / frame_height
+```
+
+`object_scale` therefore remains comparable between 720p, 1080p and 4K input.
+The current bounded camera-view decisions are:
+
+| Observation | Resolved collection mode |
+| --- | --- |
+| scale `< .075`, dropout `>= .35`, or 8+ fragmentations/60 s | `tolerant_collection` |
+| scale `>= .18`, dropout `<= .08`, and at most 1 fragmentation/60 s | `strict` |
+| otherwise | `balanced` |
+
+Presence, zone and count resolve this independently for people and vehicles.
+Tracking also uses bbox diagonal/frame diagonal, observed motion, frame size and
+processing FPS to resolve association distance and time-based retention.
+
+Absolute pixels are retained where model readability depends on real source
+detail. ANPR therefore uses both frame-relative plate coverage and actual plate
+width/height, sharpness, OCR confidence, text agreement and unreadable rate.
+Identity uses person coverage plus face width, SixDRepNet pose quality, face
+quality, face-detection success, frame sharpness and exposure.
 
 Recommended modes:
 
@@ -102,6 +132,34 @@ Example telemetry:
 }
 ```
 
+Implemented bounded profiles:
+
+| Subsystem | Strict | Balanced | Tolerant collection |
+| --- | --- | --- | --- |
+| Presence | `3` hits, unobserved `2 s`, ended `8 s` | `3`, `5 s`, `18 s` | `4`, `5 s`, `20 s` |
+| Zone | margin `.008`, `2` votes, `.25 s` | `.012`, `2`, `.50 s` | `.018`, `4`, `.80 s` |
+| Count | `2` votes, `.25 s` | `2`, `.25 s` | `4`, `.80 s` |
+| ANPR | `1.5 s`, OCR `.40`, `3` reads | `2.5 s`, `.35`, `2` | `3.5 s`, `.35`, `2` |
+| Identity | face `48 px`/quality `.40`, body `40x80` | face `32 px`/`.30`, body `32x64` | face `28 px`/`.30`, body `28x56` |
+| Fire/smoke | score `.62`, `4` positives | `.65`, `5` | `.70`, `6` |
+
+Mode changes require two consecutive five-second resolver evaluations. The
+resolver may extend collection/recovery, but cannot lower the final ANPR or
+hazard emission standard below the balanced truth gate.
+
+For a small/distant tracked subject (normalized width below `0.05`, normalized
+height below `0.05`, or maximum normalized side below `0.12`), the event layer
+extends the resolved unobserved window by `2x`, capped at `10 s`, and the
+ended-unknown window by `1.1x`, capped at `22 s`. This suppresses short
+detector-dropout lifecycle pairs without treating tracker predictions as fresh
+observations.
+
+`/healthz` reports the raw measurements, person/vehicle profiles, effective
+gates and `decision_reasons`. Elevated pressure doubles optional periodic scene
+sampling intervals; critical pressure suppresses optional periodic sampling.
+Positive event-triggered scene evidence still passes through the hard outbox
+capacity guard. These are edge-runtime decisions and do not alter V6 payloads.
+
 ## 4. Common Detection, Dedup, and Tracking Gates
 
 Current V6.0 defaults:
@@ -112,19 +170,19 @@ Current V6.0 defaults:
 | Detection class confidence config | `0.25` per class | Config fallback, detector uses minimum confidence |
 | Dedup IoU | `0.55` | Overlapping boxes are duplicate candidates |
 | Dedup containment | `0.85` | Box mostly inside another box is duplicate candidate |
-| Tracker max distance | `320 px` | Match detection to prior track center |
-| Tracker max disappeared | `45 frames` | Tracker memory before deregister |
+| Tracker max distance | `320 px` fallback | Runtime resolves a bounded frame/motion-aware value |
+| Tracker max disappeared | `45 frames` fallback | Runtime resolves seconds and converts using processing FPS |
 | Tracker bbox smoothing | `0.25` | Smooth bbox changes |
 | Tracker min IoU | `0.01` | Minimal shape overlap for far matches |
 | Tracker class aware | `false` | Allows class correction across similar vehicle classes |
 | Presence stable hits | `3` | Confirmation before subject events |
 | Candidate max gap | `1.5 s` | Reset weak candidate if observations are too sparse |
 
-Production changes:
+Implemented production behavior:
 
-- `max_distance_px` should be resolved from frame size, FPS, observed speed, and
+- `max_distance_px` is resolved from frame size, FPS, observed speed, and
   missed frame count instead of fixed globally.
-- `max_disappeared` should be expressed as seconds and converted to frames.
+- `max_disappeared` is expressed as seconds and converted to frames.
 - Dedup thresholds remain defaults, but camera telemetry should flag over-merge
   and duplicate-track patterns.
 
@@ -188,6 +246,11 @@ Outputs:
 - `presence_unobserved` or current `track_lost` when temporarily not observed.
 - `presence_ended_unknown` only after the recovery grace expires.
 
+Lifecycle outputs are emitted only when a person/vehicle presence use case owns
+the presence. Counting-only, ANPR-only, and identity-only bindings keep local
+association state but do not emit `track_lost`, `presence_recovered`, or
+`presence_ended_unknown` traffic.
+
 Recommended rename: treat `track_lost` as `presence_unobserved` semantically.
 
 ## 6. Vehicle and Person Presence
@@ -250,8 +313,9 @@ Current gates:
 | Gate | Value |
 | --- | ---: |
 | Presence stable hits | `3` |
-| Boundary margin | `0.01` normalized |
-| Transition votes | `2` observations |
+| Boundary margin | adaptive `.008-.018` normalized; balanced `.012` |
+| Transition votes | adaptive `2-4` observations; balanced `2` |
+| Transition hold | adaptive `.25-.80 s`; balanced `.50 s` |
 
 Outputs:
 
@@ -303,7 +367,7 @@ Current gates:
 | Gate | Value |
 | --- | ---: |
 | Track stable hits | `3` |
-| Count debounce | `2` observations |
+| Count debounce | `2` observations plus `.25 s` balanced hold |
 | Heartbeat | `20 s` |
 
 Output:
@@ -397,6 +461,17 @@ Required production emission policy:
 - Emit `plate_outcome=unreadable` when a plate candidate exists but readable
   text cannot stabilize within the attempt/window policy.
 
+Implemented balanced emission gate:
+
+- Candidate window `2.5 s`.
+- OCR confidence at least `0.35` for emission (`0.25` remains an internal OCR
+  collection threshold).
+- At least two distinct accepted OCR observations, or one result at least
+  `0.82` after the complete window.
+- Plate at least `22 x 7 px`, sharpness at least `8`, aspect ratio `0.8-12.0`.
+- A repeated high-confidence result may emit early only after two distinct OCR
+  observations. Re-reading stale OCR metadata does not count as agreement.
+
 Suggested adaptive ranges:
 
 | Mode | Candidate window | OCR min | Confirm reads | Min plate width | Sharpness |
@@ -447,6 +522,12 @@ Each output must include:
 Add `identity_sample_group_id` so Management can group face/body/gait samples
 selected from the same presence window even when emitted as separate events.
 
+The runtime creates this group internally. The strict V6.0 wire schemas do not
+currently permit this field, so it is not added to Event/Embedding payloads.
+`presence_id`, sample timestamps, and model profile IDs remain the V6.0 wire
+correlation keys. Adding the group to the wire requires a future contract/schema
+revision, not an undocumented V6 extension.
+
 ### Face
 
 Inputs:
@@ -456,7 +537,7 @@ Inputs:
 - AdaFace embedding.
 - Face quality.
 
-Current gates:
+Implemented emission gates:
 
 | Gate | Value |
 | --- | ---: |
@@ -596,10 +677,10 @@ Current gates:
 | Gate | Value |
 | --- | ---: |
 | Detector confidence | `0.35` |
-| Event confidence | `0.55` |
+| Event confidence | adaptive `.62-.70`; balanced `.65` |
 | Model cadence | every `5th` processed frame |
-| Positive confirmation | `3` positives within `2 s` |
-| Clear confirmation | `10 s` negative |
+| Positive confirmation | adaptive `4-6` spatially consistent positives; balanced `5` within `3 s` |
+| Clear confirmation | `10 s`, at least `5` evaluated negatives, no evaluation gap over `2.5 s` |
 | NMS IoU | `0.45` |
 | Model input size | `320` |
 
@@ -624,6 +705,8 @@ Guardrails:
 - `suspected` is not a confirmed incident.
 - `cleared` means observed clear for the configured interval, not a safety
   guarantee.
+- Dropped, skipped, or unevaluated frames never count as negative evidence; a
+  long evaluation gap resets the clear candidate.
 
 ## 14. Health and Delivery
 
@@ -650,13 +733,27 @@ Guardrails:
 - Optional scene jobs may be skipped before event creation under pressure.
 - Sampling gaps must be reported.
 
-## 15. Implementation Priorities
+## 15. V6 Implementation Status
 
-1. Add adaptive policy resolver and resolved-policy telemetry.
-2. Make presence unobserved and ended-unknown timeouts configurable/adaptive.
-3. Add ANPR best-candidate first-read window.
-4. Add vehicle local recovery after track breaks.
-5. Add `identity_sample_group_id` for connected face/body/gait samples.
-6. Add timestamp source fields and ensure event/evidence/embedding times refer
-   to the selected source frame.
-7. Keep count logic as-is except policy telemetry.
+Implemented:
+
+1. Bounded adaptive resolver with hysteresis and `/healthz` telemetry.
+2. Resolution/motion-aware tracker association and time-based retention.
+3. Adaptive presence unobserved/ended-unknown windows and ambiguity-aware local
+   recovery.
+4. Positive zone transition votes/hold; track loss never creates exit.
+5. Debounced `visible_now` counts with 20-second freshness heartbeat.
+6. ANPR distinct-observation best-candidate window, quality gates, unreadable
+   outcome, confidence improvement, cooldown, and correction protection.
+7. Independent face/body/gait selection from original-frame crops.
+8. Spatially and temporally confirmed fire/smoke episodes.
+9. Source-frame event/evidence/embedding times and `/healthz` timestamp-source
+   telemetry.
+10. Durable Event -> Evidence -> Embedding delivery and scene backpressure.
+
+Contract-preserving deferrals:
+
+- `identity_sample_group_id` and per-Event `timestamp_source` are not placed on
+  the V6 wire because the strict 6.0 schemas do not define them.
+- Cross-camera identity, named recognition, incidents, dwell rules, and alerts
+  remain Management responsibilities.

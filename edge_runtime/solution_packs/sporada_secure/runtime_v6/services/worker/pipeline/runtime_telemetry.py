@@ -7,6 +7,7 @@ diagnostic only: they never participate in event production decisions.
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
@@ -84,6 +85,8 @@ class CameraTelemetry:
         self._device_calls: dict[str, int] = defaultdict(int)
         self._window_device_calls: dict[str, int] = defaultdict(int)
         self._proc = psutil.Process()
+        self._resolved_policy: dict[str, Any] | None = None
+        self._timestamp_source = "edge_received_at"
         self._proc.cpu_percent(interval=None)
         self.latest_snapshot: dict[str, Any] | None = None
         self.flush(force=True)
@@ -94,6 +97,17 @@ class CameraTelemetry:
         with self._lock:
             self._counters[name] += int(value)
             self._window_counters[name] += int(value)
+
+    def set_resolved_policy(self, policy: dict[str, Any]) -> None:
+        """Publish the effective bounded gates without putting them in desired state."""
+        with self._lock:
+            self._resolved_policy = deepcopy(policy)
+
+    def set_timestamp_source(self, source: str) -> None:
+        if source not in {"source_pts", "rtsp_ntp", "edge_received_at"}:
+            source = "edge_received_at"
+        with self._lock:
+            self._timestamp_source = source
 
     def frame(self, *, inferred: bool | None) -> None:
         """Record a decoded frame and its completed processing disposition.
@@ -262,6 +276,8 @@ class CameraTelemetry:
             ),
             "resources": {"process": process, "accelerators": accelerators},
             "device_placement": dict(sorted(self.devices.items())),
+            "timestamp_source": self._timestamp_source,
+            "resolved_policy": deepcopy(self._resolved_policy),
         }
 
     @staticmethod
