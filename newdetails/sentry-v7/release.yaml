@@ -1,0 +1,38 @@
+contract: sentry-v7
+schema_version: "7.0"
+wire_schema_version: "7.0"
+multi_box_delivery_contract: "7.0"
+status: contract-ready-awaiting-qualified-image
+image: null
+digest: null
+architecture: amd64
+hardware_profile: intel-285h
+capabilities:
+  hardware_profile: intel-285h
+  wire_schema_version: "7.0"
+  multi_box_delivery: "7.0"
+changes:
+  - authenticated_per_deployment_stream_delivery
+  - per_object_idempotency_and_watermarks
+  - durable_remote_outbox_with_skip_tombstones
+  - independent_sequences_for_deployments_on_one_box
+  - explicit_local_v7_and_remote_v7_delivery_modes
+  - placement_generation_fencing
+  - permanent_stream_across_placement_generations
+  - stream_bootstrap_and_conflict_resolution
+  - qualified_local_path_sqlite_storage
+  - fifty_camera_contract_limit
+  - site_ca_https_ingest
+  - transactional_sqlite_outbox
+  - crash_safe_skip_pending_eviction
+  - motion_detection_gate_enabled
+  - surface_motion_detection_gate_disabled
+  - face_only_identity_recognition_policy
+  - action_context_not_included
+  - policy_clip_capture_not_included
+verification:
+  image_metadata: awaiting-new-image
+  static_contract: passed
+  container_smoke: pending
+  intel_hardware_and_live_camera: pending
+  multi_box_delivery_7_0: requires-new-image

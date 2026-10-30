@@ -1,0 +1,10 @@
+{
+  "status": "accepted",
+  "sequence": 4,
+  "deployment_id": "north-yard",
+  "box_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "placement_generation": 3,
+  "stream_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  "highest_contiguous_sequence": 3,
+  "highest_received_sequence": 4
+}
