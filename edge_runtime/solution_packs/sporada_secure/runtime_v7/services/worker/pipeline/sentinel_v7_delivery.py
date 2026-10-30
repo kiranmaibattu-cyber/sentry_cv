@@ -126,6 +126,8 @@ class SentinelV7Metrics:
         with self.lock:
             payload = {
                 "schema_version": "2.0",
+                "schema_scope": "delivery_telemetry",
+                "wire_schema_version": "7.0",
                 "contract": "sentry-v7",
                 "deployment_id": self.deployment_id,
                 "camera_id": self.camera_id,
@@ -748,7 +750,7 @@ class SentinelV7Uploader(threading.Thread):
                 continue
             try:
                 if not self.bootstrapped:
-                    self._bootstrap()
+                    self._bootstrap_stream()
                     self.bootstrapped = True
                 record = self.store.claim(self.owner, limit=8)
                 if record is None:
@@ -783,7 +785,7 @@ class SentinelV7Uploader(threading.Thread):
         if self.is_alive():
             self.join(timeout=5)
 
-    def _bootstrap(self) -> None:
+    def _bootstrap_stream(self) -> None:
         ack = self._request_json("GET", "/api/v7/ingest/stream", None, "stream", None)
         try:
             self.store.store_bootstrap(ack)

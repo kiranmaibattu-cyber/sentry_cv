@@ -57,7 +57,8 @@ from traffic_pilot_runtime.adapter import write_worker_config
 from traffic_pilot_runtime.graph import compile_runtime_plan
 from traffic_pilot_runtime.runtime_logging import _sanitize as sanitize_supervisor_log
 from traffic_pilot_runtime.solution_image_entrypoint import (
-    RuntimeState, _health_payload, _hot_reload_signature, _metrics, _per_camera_state,
+    RuntimeState, WorkerSupervisor, _health_payload, _hot_reload_signature,
+    _metrics, _per_camera_state,
 )
 
 
@@ -91,6 +92,65 @@ class Gait:
             self.buffer_times[key] = [float(captured_at or 0.0) - 1.0, float(captured_at or 0.0)]
             output[track_id] = vector
         return output
+
+
+def test_v7_uploader_start_uses_python_thread_bootstrap():
+    """The uploader must never shadow threading.Thread._bootstrap()."""
+    uploader = SentinelV7Uploader.__new__(SentinelV7Uploader)
+    threading.Thread.__init__(uploader, name="v7-uploader-test", daemon=True)
+    uploader.stop_event = threading.Event()
+    uploader.paused_protocol_error = False
+    uploader.bootstrapped = False
+    called = threading.Event()
+
+    class Store:
+        def claim(self, _owner, limit):
+            assert limit == 8
+            return None
+
+    uploader.store = Store()
+    uploader.owner = "test-owner"
+
+    def bootstrap_stream():
+        called.set()
+        uploader.stop_event.set()
+
+    uploader._bootstrap_stream = bootstrap_stream
+    uploader.start()
+    assert called.wait(1)
+    uploader.join(timeout=1)
+    assert not uploader.is_alive()
+    assert "_bootstrap" not in SentinelV7Uploader.__dict__
+
+
+def test_shared_readiness_requires_an_initialized_camera_pipeline(tmp_path):
+    state = RuntimeState("/configs/desired_state.json")
+    supervisor = WorkerSupervisor(tmp_path, tmp_path, state)
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    supervisor.ready_dir = ready_dir
+    supervisor.expected_camera_ids = ("cam-a", "cam-b")
+
+    class RunningProcess:
+        pid = 123
+
+        @staticmethod
+        def poll():
+            return None
+
+    supervisor.process = RunningProcess()
+    with state.lock:
+        state.plan = {
+            "edge_id": "edge-a",
+            "cameras": [{"camera_id": "cam-a"}, {"camera_id": "cam-b"}],
+        }
+
+    supervisor.poll_worker()
+    assert state.snapshot()["ready"] is False
+
+    (ready_dir / "cam-b.ready").write_text("ready\n", encoding="utf-8")
+    supervisor.poll_worker()
+    assert state.snapshot()["ready"] is True
 
 
 def test_dynamic_vehicle_model_class_map_and_contract_vehicle_types():
@@ -245,6 +305,15 @@ def test_health_payload_and_prometheus_metrics_include_per_camera_telemetry(
     }, 0.001)
     time.sleep(0.02)
     telemetry.flush(force=True)
+    metrics_root = tmp_path / "metrics"
+    (metrics_root / "system-health.json").write_text(json.dumps({
+        "schema_version": "1.0",
+        "observed_at": "2026-10-30T10:00:00Z",
+        "inference": {
+            "backend": "openvino", "available": True,
+            "models_loaded": ["vehicle", "license_plate", "ocr"],
+        },
+    }), encoding="utf-8")
     state = RuntimeState("/configs/desired_state.json")
     with state.lock:
         state.ready = True
@@ -263,6 +332,10 @@ def test_health_payload_and_prometheus_metrics_include_per_camera_telemetry(
     }
     assert camera["processing"]["decoded_fps"] > 0
     assert payload["telemetry"]["accelerators"]["GPU"]["hardware_utilization_pct"] is None
+    assert payload["telemetry"]["system"]["inference"]["models_loaded"] == ["vehicle"]
+    assert payload["telemetry"]["system"]["inference"]["models_loaded_scope"] == (
+        "active_camera_pipeline_stages"
+    )
     prometheus = _metrics(state)
     assert 'sentinel_camera_decoded_fps{camera_id="cam-a"}' in prometheus
     assert 'sentinel_use_case_latency_seconds{camera_id="cam-a",stage="detection.vehicle_person"}' in prometheus
@@ -1641,6 +1714,18 @@ def test_v7_shared_database_allocates_one_deployment_sequence(tmp_path):
             "SELECT sequence FROM records ORDER BY sequence"
         )]
     assert sequences == list(range(1, 21))
+
+
+def test_v7_delivery_metrics_distinguish_telemetry_and_wire_schema(tmp_path):
+    store = SentinelV7Outbox(tmp_path, "deployment-a", "cam-a")
+    store.metrics.snapshot(store)
+    payload = json.loads((
+        tmp_path / "metrics" / "sentinel-delivery-cam-a.json"
+    ).read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "2.0"
+    assert payload["schema_scope"] == "delivery_telemetry"
+    assert payload["wire_schema_version"] == "7.0"
+    assert payload["contract"] == "sentry-v7"
 
 
 def test_scene_pressure_skips_job_and_reports_gap(tmp_path, monkeypatch):

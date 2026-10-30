@@ -31,6 +31,7 @@ from typing import Any
 import uuid
 
 from pipeline.motion_gate import MotionGateController
+from pipeline.camera_state import publish_camera_state
 from pipeline.runtime_status import (
     increment_supervisor_status,
     read_decoder_status,
@@ -579,12 +580,10 @@ def _camera_proc_impl(cam: dict, camera_config: dict, redis_host: str, redis_por
              name, "enabled" if motion_gate is not None else "disabled",
              MOTION_CONFIRM_NEED, MOTION_CONFIRM_WIN, MOTION_RELEASE_MISSES,
              MOTION_SWEEP_SECONDS)
-    ready_dir = os.getenv("APEXFABRIC_CAMERA_READY_DIR")
-    ready_path = None
-    if ready_dir:
-        path = Path(ready_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        ready_path = path / f"{name}.ready"
+    # This marker means the camera's models, policy, durable outbox and uploader
+    # have initialized. Stream availability remains a camera-health concern and
+    # must not prevent healthy peers from making the shared runtime ready.
+    publish_camera_state(name, camera_config, "ffmpeg")
     dec = FfmpegDecoder(
         uri, fps=camera_fps, name=name,
         status_callback=v7_pipeline.camera_status if v7_pipeline is not None else None,
@@ -603,11 +602,6 @@ def _camera_proc_impl(cam: dict, camera_config: dict, redis_host: str, redis_por
         fidx += 1
         frame_received_at = time.time()
         frame_processing_started = time.perf_counter()
-        if ready_path is not None:
-            temporary = ready_path.parent / f".{name}.tmp"
-            temporary.write_text("ready\n", encoding="utf-8")
-            os.replace(temporary, ready_path)
-            ready_path = None
         now = time.time()
         if now - last_config_check >= CAMERA_CONFIG_RELOAD_INTERVAL_S:
             last_config_check = now
@@ -615,6 +609,7 @@ def _camera_proc_impl(cam: dict, camera_config: dict, redis_host: str, redis_por
             config_mtime_ns = _refresh_camera_config_if_changed(name, camera_config, config_mtime_ns)
             if config_mtime_ns != previous_mtime_ns and v7_pipeline is not None:
                 v7_pipeline.reconfigure(camera_config)
+                publish_camera_state(name, camera_config, "ffmpeg")
         if motion_gate is None:
             gate_state, gate_ran, gate_reason = "off", True, "disabled"
         else:

@@ -142,6 +142,30 @@ class WorkerSupervisor:
         self.generated_dir = generated_dir
         self.state = state
         self.process: subprocess.Popen | None = None
+        self.ready_dir: Path | None = None
+        self.expected_camera_ids: tuple[str, ...] = ()
+
+    @staticmethod
+    def _camera_initialization_ready(
+        ready_dir: Path, expected_camera_ids: tuple[str, ...]
+    ) -> bool:
+        """Shared readiness needs one initialized camera, not one decoded frame.
+
+        Camera stream outages remain camera-local health failures.  Requiring every
+        camera would let one bad stream block healthy peers, while accepting only a
+        live fleet parent would hide camera-pipeline initialization deadlocks.
+        """
+        return any((ready_dir / f"{camera_id}.ready").is_file()
+                   for camera_id in expected_camera_ids)
+
+    def _is_initialized(self) -> bool:
+        return bool(
+            self.ready_dir
+            and self.expected_camera_ids
+            and self._camera_initialization_ready(
+                self.ready_dir, self.expected_camera_ids
+            )
+        )
 
     def start_or_replace(self, desired: DesiredState, plan: RuntimePlan, cameras_file: Path) -> None:
         env = os.environ.copy()
@@ -165,18 +189,37 @@ class WorkerSupervisor:
                    "camera_count": len(desired.cameras)},
         )
         new_process = subprocess.Popen(command, cwd=str(self.repo_root), env=env)
-        deadline = time.monotonic() + float(os.getenv("WORKER_SUPERVISOR_STARTUP_SECONDS", "3"))
-        while time.monotonic() < deadline:
-            if new_process.poll() is not None:
-                raise RuntimeError(f"new worker exited during startup with code {new_process.returncode}")
-            time.sleep(0.25)
+        expected_camera_ids = tuple(camera.camera_id for camera in desired.cameras)
+        deadline = time.monotonic() + float(os.getenv(
+            "WORKER_CAMERA_INITIALIZATION_SECONDS", "120"
+        ))
+        try:
+            while time.monotonic() < deadline:
+                if new_process.poll() is not None:
+                    raise RuntimeError(
+                        "new worker exited during startup with code "
+                        f"{new_process.returncode}"
+                    )
+                if self._camera_initialization_ready(ready_dir, expected_camera_ids):
+                    break
+                time.sleep(0.25)
+            else:
+                raise RuntimeError(
+                    "no camera pipeline completed initialization before the "
+                    "startup deadline"
+                )
+        except Exception:
+            self._stop_process(new_process)
+            raise
         old_process = self.process
         self.process = new_process
+        self.ready_dir = ready_dir
+        self.expected_camera_ids = expected_camera_ids
         self._stop_process(old_process)
         with self.state.lock:
             self.state.worker_pid = new_process.pid
             self.state.worker_running = True
-            self.state.ready = True
+            self.state.ready = self._is_initialized()
             self.state.active_revision = desired.revision
             self.state.active_hash = desired.content_hash
             self.state.plan = plan.to_dict()
@@ -195,11 +238,13 @@ class WorkerSupervisor:
         with self.state.lock:
             self.state.worker_running = running
             self.state.worker_pid = proc.pid if running and proc else None
-            self.state.ready = running and bool(self.state.plan)
+            self.state.ready = running and bool(self.state.plan) and self._is_initialized()
 
     def stop(self) -> None:
         self._stop_process(self.process)
         self.process = None
+        self.ready_dir = None
+        self.expected_camera_ids = ()
         self.poll_worker()
 
     @staticmethod
@@ -572,6 +617,16 @@ def _health_payload(state: RuntimeState) -> dict[str, Any]:
     system["fresh"] = bool(system_age is not None and system_age <= 15.0)
 
     camera_values = list(by_camera.values())
+    active_model_stages = sorted({
+        str(stage)
+        for camera in camera_values
+        for stage in (camera.get("device_placement") or {})
+        if stage != "decode"
+    })
+    inference = system.get("inference")
+    if isinstance(inference, dict):
+        inference["models_loaded"] = active_model_stages
+        inference["models_loaded_scope"] = "active_camera_pipeline_stages"
     process_cpu_cores = 0.0
     process_rss = 0.0
     process_pss = 0.0

@@ -581,6 +581,9 @@ def run_surface_camera(cam: dict, camera_config: dict, redis_host: str,
                 "GPU+NPU" if face_pipeline is not None else "disabled")
 
     from pipeline.camera_state import publish_camera_state
+    # Analytics initialization is complete even if the live source is currently
+    # unavailable. Decoder health and reconnect state are reported separately.
+    publish_camera_state(name, camera_config, 'surface')
     import json
     is_live = uri.startswith(('rtsp://', 'rtsps://'))
     stats = Counter()

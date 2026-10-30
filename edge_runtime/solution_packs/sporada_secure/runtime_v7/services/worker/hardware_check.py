@@ -53,7 +53,10 @@ def detect_topology() -> Topology:
         detector_backend="openvino",
         inference_available=bool(devices),
         inference_devices=",".join(devices) if devices else "unavailable",
-        models_resident=["vehicle", "license_plate", "ocr"],
+        # Model loading is camera/use-case dependent and happens after this
+        # topology probe. /healthz derives the active model stages from current
+        # per-camera telemetry instead of publishing a static legacy list.
+        models_resident=[],
     )
 
 
